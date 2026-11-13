@@ -7,3 +7,22 @@ requires = [
 ]
 
 build-backend = "setuptools.build_meta"
+
+[project]
+name = "concavehull"
+version = "0.1.0"
+description = "Concave hull (chi-shape) and chi-outline algorithms for 2D point sets, with Python bindings."
+requires-python = ">=3.8"
+dependencies = [
+    "numpy"
+]
+
+[dependency-groups]
+dev = [
+    "matplotlib",
+    "jupyterlab",
+    "ipykernel",
+    "ipywidgets",
+    "nbconvert",
+    "notebook>=7.3.3",
+]

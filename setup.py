@@ -10,7 +10,6 @@ ext_modules = [
 ]
 
 setup(
-    name="concavehull",
-    ext_modules=ext_modules,    
+    ext_modules=ext_modules,
     cmdclass={"build_ext": build_ext}
 )
