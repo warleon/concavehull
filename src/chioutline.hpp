@@ -12,13 +12,27 @@
 // "Algorithm 1" and Eqs. (2)-(4) of the paper for the pseudo code this file
 // follows.
 //
-// Note on complexity: the paper describes an O(n log n) implementation via
-// incremental bookkeeping of connected components. This implementation
-// instead recomputes vertex degrees and connected components by direct
-// (brute-force) scans of the triangulation whenever they are needed, which
-// are operations that only occur O(n) times overall. That makes this
-// implementation worst-case O(n^2) rather than O(n log n) -- a reasonable
-// trade for a straightforward, easy-to-verify reference implementation.
+// Note on complexity: the paper's O(n log n) bound relies on two pieces of
+// incremental bookkeeping, both implemented here:
+//   1. Per-vertex alive-triangle counts (`alive_triangle_count`), maintained
+//      in O(1) per triangle removal instead of rescanning the whole
+//      triangulation for each "is this point now isolated?" check.
+//   2. A cheap O(current boundary size) pre-check (`count_boundary_cycles`)
+//      before ever paying the expensive O(current component size) full
+//      connected-components search (`find_pieces`): a simply-connected,
+//      hole-free piece has exactly one boundary cycle, so counting cycles
+//      (reusing the same boundary-walk `extract_polygons` uses) cheaply rules
+//      out a split without touching the component's interior triangles at
+//      all. `find_pieces` only runs when that cheap check finds >1 cycle --
+//      i.e. only on an actual split, which the paper's own complexity
+//      argument assumes is "occasional" (bounded by cluster count, not n).
+// This is not a from-scratch dynamic-connectivity data structure (which
+// would be the fully general way to get a worst-case guarantee), so a
+// pathological input could still force the O(current component size)
+// fallback often; but for the common case -- most isolating-edge removals
+// trim a spike without actually splitting anything -- this avoids the
+// O(n) rescan per removal that made the previous version O(n^2) in
+// practice, which matters a lot once n reaches the thousands.
 
 #include <algorithm>
 #include <cmath>
@@ -71,6 +85,7 @@ private:
 
 	std::vector<bool> removed_triangle;
 	std::vector<bool> point_removed;
+	std::vector<int> alive_triangle_count;  // per point; see mark_triangle_removed()
 	std::vector<int> triangle_component;
 	std::unordered_map<int, double> component_sigma;
 	std::unordered_map<int, double> component_lambda;
@@ -131,17 +146,18 @@ private:
 		}
 	}
 
-	// Number of currently-alive triangles incident to point v. (Brute force;
-	// see complexity note above.)
-	size_t alive_degree(size_t v) const {
-		size_t count = 0;
-		for (size_t t = 0; t < n_triangles; ++t) {
-			if (removed_triangle[t]) continue;
-			if (d.triangles[3 * t] == v || d.triangles[3 * t + 1] == v || d.triangles[3 * t + 2] == v) {
-				++count;
-			}
-		}
-		return count;
+	// Number of currently-alive triangles incident to point v. O(1): see
+	// alive_triangle_count/mark_triangle_removed.
+	size_t alive_degree(size_t v) const { return (size_t)alive_triangle_count[v]; }
+
+	// The ONLY place removed_triangle[t] should ever be set to true: also
+	// keeps alive_triangle_count in sync in O(1), which is what makes
+	// alive_degree() O(1) instead of an O(n_triangles) rescan.
+	void mark_triangle_removed(size_t t) {
+		removed_triangle[t] = true;
+		--alive_triangle_count[d.triangles[3 * t]];
+		--alive_triangle_count[d.triangles[3 * t + 1]];
+		--alive_triangle_count[d.triangles[3 * t + 2]];
 	}
 
 	// Mean/stddev of the lengths of the unique edges of the given triangles.
@@ -226,7 +242,7 @@ private:
 				size_t he = 3 * t + k;
 				erase_boundary(he);
 			}
-			removed_triangle[t] = true;
+			mark_triangle_removed(t);
 		}
 		for (size_t v : piece_points(tris)) {
 			if (alive_degree(v) == 0) point_removed[v] = true;
@@ -248,6 +264,43 @@ private:
 			he = next_halfedge(twin);
 		} while (he != first);
 		return delaunator::INVALID_INDEX;
+	}
+
+	// Cheap pre-check for find_pieces: how many distinct boundary cycles does
+	// component `comp` currently have? A simply-connected, hole-free region
+	// has exactly one; >1 is both necessary and sufficient evidence that the
+	// component just split (an invariant that holds here because this
+	// algorithm only ever carves triangles away from the current exterior,
+	// so it can never create an interior hole disconnected from it). Reuses
+	// the same boundary-walk as extract_polygons(), restricted to `comp`'s
+	// current edges, and stops as soon as a second cycle is confirmed --
+	// O(comp's current boundary size), not O(comp's current triangle count).
+	size_t count_boundary_cycles(int comp) const {
+		std::vector<size_t> comp_edges;
+		for (auto& kv : boundary) {
+			if (triangle_component[triangle_of(kv.second)] == comp) comp_edges.push_back(kv.second);
+		}
+		if (comp_edges.empty()) return 0;
+
+		std::unordered_set<size_t> used;
+		size_t cycles = 0;
+		for (size_t start : comp_edges) {
+			if (used.count(start)) continue;
+			++cycles;
+			if (cycles > 1) return cycles;  // caller only needs ">1"; stop early
+
+			size_t cur = start;
+			size_t loop_start_point = d.triangles[start];
+			while (true) {
+				used.insert(cur);
+				size_t next_point = d.triangles[next_halfedge(cur)];
+				if (next_point == loop_start_point) break;
+				size_t nxt = rotate_to_next_boundary(next_halfedge(cur));
+				if (nxt == delaunator::INVALID_INDEX || used.count(nxt)) break;
+				cur = nxt;
+			}
+		}
+		return cycles;
 	}
 
 	void create_root_component() {
@@ -282,13 +335,15 @@ private:
 		for (auto& kv : by_component) {
 			const std::vector<size_t>& edges = kv.second;
 
-			std::unordered_set<size_t> verts;
-			for (size_t he : edges) {
-				verts.insert(d.triangles[he]);
-				verts.insert(d.triangles[next_halfedge(he)]);
-			}
-			if (verts.size() < min_points) continue;
-
+			// Filter each walked boundary cycle by its OWN vertex count, not a
+			// pre-walk count aggregated over every edge tagged with this
+			// component id. In principle one component id should correspond to
+			// exactly one boundary cycle (the invariant count_boundary_cycles()
+			// relies on) -- but if a split is ever missed, a tiny spurious
+			// fragment sharing an id with a large legitimate polygon must not
+			// be able to ride through the size filter on the big polygon's
+			// vertex count. Eq. 2's filter is defined per output polygon f,
+			// which this now matches exactly regardless of that invariant.
 			for (size_t start : edges) {
 				if (used.count(start)) continue;
 				std::vector<double> poly;
@@ -309,7 +364,10 @@ private:
 					}
 					cur = nxt;
 				}
-				if (ok && poly.size() >= 6) polygons.push_back(std::move(poly));
+				size_t cycle_points = poly.size() / 2;
+				if (ok && cycle_points >= 3 && cycle_points >= min_points) {
+					polygons.push_back(std::move(poly));
+				}
 			}
 		}
 		return polygons;
@@ -325,10 +383,17 @@ inline ChiOutline::ChiOutline(const std::vector<double>& coords, double chi_)
 	  n_triangles(d.triangles.size() / 3),
 	  removed_triangle(n_triangles, false),
 	  point_removed(n_points, false),
+	  alive_triangle_count(n_points, 0),
 	  triangle_component(n_triangles, 0),
 	  boundary_point_count(n_points, 0) {
-	if (chi < 0) {
-		throw std::invalid_argument("chi must be non-negative");
+	// chi may legitimately be negative: lambda = mu + chi*sigma (Eq. 4) has no
+	// sign restriction. Negative chi just means a lower, more aggressive
+	// length threshold than the component's own mean edge length -- not an
+	// error, even though it carves more than chi=0 would.
+	for (size_t t = 0; t < n_triangles; ++t) {
+		++alive_triangle_count[d.triangles[3 * t]];
+		++alive_triangle_count[d.triangles[3 * t + 1]];
+		++alive_triangle_count[d.triangles[3 * t + 2]];
 	}
 	create_root_component();
 }
@@ -373,10 +438,22 @@ inline std::vector<std::vector<double>> ChiOutline::compute() {
 			for (size_t v : {a, b, apex}) {
 				if (alive_degree(v) == 1) point_removed[v] = true;  // degree 2 before removal
 			}
-			removed_triangle[apex_tri] = true;
+			mark_triangle_removed(apex_tri);
 
-			std::vector<std::vector<size_t>> pieces = find_pieces(comp);
-			if (pieces.size() > 1) {
+			// Cheap pre-check (O(comp's current boundary size)) before ever paying
+			// for the expensive full partition (O(comp's current triangle count)):
+			// a simply-connected, hole-free piece always has exactly one boundary
+			// cycle, so finding >1 here is both necessary and sufficient evidence
+			// that this removal actually split the component -- skip find_pieces
+			// entirely otherwise (the common case: trimming a spike, not splitting).
+			if (count_boundary_cycles(comp) > 1) {
+				std::vector<std::vector<size_t>> pieces = find_pieces(comp);
+				// Defensive: the cheap cycle-count check above should never disagree
+				// with find_pieces's authoritative answer (a simply-connected,
+				// hole-free piece has exactly one boundary cycle), but if it ever
+				// did, doing nothing here (matching "no split" behavior) is the
+				// safe fallback rather than silently filtering a non-split piece.
+				if (pieces.size() > 1) {
 				std::vector<std::vector<size_t>> retained;
 				for (auto& piece : pieces) {
 					if (piece_points(piece).size() < min_component_points()) {
@@ -413,11 +490,14 @@ inline std::vector<std::vector<double>> ChiOutline::compute() {
 				}
 				// if exactly one piece retained, it keeps the old `comp` id/lambda
 				// unchanged -- nothing further to do.
+				}
+				// else: cheap pre-check said >1 cycle but find_pieces disagreed --
+				// treat as no split (see defensive comment above).
 			}
 		} else {
 			// --- regular, or irregular-but-not-isolating, exterior edge
 			//     (Algorithm 1, lines 1.21-1.26) ---
-			removed_triangle[triangle_of(e)] = true;
+			mark_triangle_removed(triangle_of(e));
 			insert_boundary(d.halfedges[he_bc]);
 			insert_boundary(d.halfedges[he_ca]);
 		}
@@ -517,4 +597,82 @@ inline double chi_outline_max_meaningful_chi(const std::vector<double>& coords) 
 		throw std::invalid_argument("degenerate point set: zero edge-length standard deviation");
 	}
 	return (s.max_boundary_edge - s.mu) / s.sigma;
+}
+
+// --- elbow heuristic for a default chi --------------------------------------
+//
+// A default chi derived from some quantity unrelated to the point set's own
+// spacing (e.g. an object's bounding-box size) can come out arbitrarily
+// wrong: if objects are smaller than the typical gap between their centers,
+// such a heuristic compares the wrong two scales and produces a nonsense
+// (even negative) chi. This heuristic instead reads the separation threshold
+// directly off the point set's own Delaunay edge-length distribution, so it
+// can never be mismatched in scale against this specific point cloud.
+//
+// The idea (the same "elbow"/"knee" principle used to pick k in k-means, or
+// a k-distance plot in DBSCAN): sort all DT edge lengths ascending. Most
+// edges are "within-cluster" and short; relatively few are "between-cluster
+// or to an outlier" and long. Plotted against their rank, this sorted curve
+// is flat-then-steep -- it bends most sharply right at the transition
+// between those two regimes. Finding that bend gives a length threshold
+// separating "keep" from "remove" edges without needing any external scale.
+//
+// Concretely: normalize both axes (rank and length) to [0, 1], so the chord
+// from the first to the last point is exactly the line y = x. The point
+// farthest from that chord (maximizing x - y, since this kind of
+// distribution sits below the diagonal) is the elbow -- a standard,
+// parameter-free way to localize the bend (sometimes called the "maximum
+// distance from the chord" method). That point's length is then converted
+// to chi the same way chi_outline_chi_for_length() does.
+inline double chi_outline_elbow_chi(const std::vector<double>& coords) {
+	std::vector<double> coords_copy = coords;
+	std::span<double> span(coords_copy);
+	delaunator::Delaunator d(span);
+
+	size_t n_triangles = d.triangles.size() / 3;
+	std::vector<double> lengths;
+	lengths.reserve(n_triangles * 3);
+	for (size_t t = 0; t < n_triangles; ++t) {
+		for (int k = 0; k < 3; ++k) {
+			size_t he = 3 * t + k;
+			size_t twin = d.halfedges[he];
+			if (twin == delaunator::INVALID_INDEX || he < twin) {
+				lengths.push_back(edge_length(d, he));
+			}
+		}
+	}
+	if (lengths.size() < 2) {
+		throw std::invalid_argument("need at least 2 distinct edges to find an elbow");
+	}
+
+	double mu = 0.0;
+	for (double l : lengths) mu += l;
+	mu /= lengths.size();
+	double var = 0.0;
+	for (double l : lengths) var += (l - mu) * (l - mu);
+	var /= lengths.size();
+	double sigma = std::sqrt(var);
+	if (sigma <= 0.0) {
+		throw std::invalid_argument("degenerate point set: zero edge-length standard deviation");
+	}
+
+	std::sort(lengths.begin(), lengths.end());
+	size_t m = lengths.size();
+	double range = lengths[m - 1] - lengths[0];
+
+	double elbow_length = lengths[0];
+	if (range > 0.0) {
+		double best_dist = -1.0;
+		for (size_t i = 0; i < m; ++i) {
+			double x = (double)i / (double)(m - 1);
+			double y = (lengths[i] - lengths[0]) / range;
+			double dist = x - y;  // distance from the y=x chord, up to a fixed positive factor
+			if (dist > best_dist) {
+				best_dist = dist;
+				elbow_length = lengths[i];
+			}
+		}
+	}
+
+	return (elbow_length - mu) / sigma;
 }

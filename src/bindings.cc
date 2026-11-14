@@ -109,6 +109,10 @@ double pychioutline_max_meaningful_chi(const py::array_t<double>& pts) {
 	return chi_outline_max_meaningful_chi(py_polygon_to_flat(pts));
 }
 
+double pychioutline_elbow_chi(const py::array_t<double>& pts) {
+	return chi_outline_elbow_chi(py_polygon_to_flat(pts));
+}
+
 std::vector<py::array_t<double>> pybottleneck_split(const BottleneckSplit& self, const py::array_t<double>& polygon) {
 	return polygons_to_py(self.split(py_polygon_to_flat(polygon)));
 }
@@ -152,7 +156,15 @@ PYBIND11_MODULE(concavehull, m) {
 	    .def_static("max_meaningful_chi", &pychioutline_max_meaningful_chi, py::arg("pts"),
 	         "The data-dependent chi value at/beyond which chi-outline "
 	         "saturates to the convex hull of `pts`, per the paper's own bound "
-	         "chi >= (max(DT_b) - mu_DT) / sigma_DT.");
+	         "chi >= (max(DT_b) - mu_DT) / sigma_DT.")
+	    .def_static("elbow_chi", &pychioutline_elbow_chi, py::arg("pts"),
+	         "A default chi derived from pts's own Delaunay edge-length "
+	         "distribution: finds the 'elbow' separating short (within-cluster) "
+	         "edges from long (between-cluster/outlier) ones via the maximum-"
+	         "distance-from-chord method on the sorted length curve, then "
+	         "converts that length to chi. Unlike a heuristic based on some "
+	         "externally-supplied scale (e.g. an object's bounding-box size), "
+	         "this can't be mismatched against this point cloud's own spacing.");
 
 	py::class_<SplitCriterion, std::shared_ptr<SplitCriterion>>(m, "SplitCriterion",
 	    "Abstract shape-classification criterion: decides whether a polygon "
