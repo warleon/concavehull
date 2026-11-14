@@ -97,6 +97,18 @@ std::vector<py::array_t<double>> pychioutline_compute(ChiOutline& self) {
 	return polygons_to_py(self.compute());
 }
 
+double pychioutline_length_for_chi(const py::array_t<double>& pts, double chi) {
+	return chi_outline_length_for_chi(py_polygon_to_flat(pts), chi);
+}
+
+double pychioutline_chi_for_length(const py::array_t<double>& pts, double length) {
+	return chi_outline_chi_for_length(py_polygon_to_flat(pts), length);
+}
+
+double pychioutline_max_meaningful_chi(const py::array_t<double>& pts) {
+	return chi_outline_max_meaningful_chi(py_polygon_to_flat(pts));
+}
+
 std::vector<py::array_t<double>> pybottleneck_split(const BottleneckSplit& self, const py::array_t<double>& polygon) {
 	return polygons_to_py(self.split(py_polygon_to_flat(polygon)));
 }
@@ -118,11 +130,29 @@ PYBIND11_MODULE(concavehull, m) {
 	py::class_<ChiOutline>(m, "ChiOutline",
 	    "Chi-outline algorithm (Zhong & Duckham, 2016): extends the chi-shape "
 	    "algorithm to produce possibly disconnected simple polygons and to "
-	    "exclude outliers, using a single parameter chi.")
+	    "exclude outliers, using a single parameter chi. NOTE: chi here is NOT "
+	    "the same kind of quantity as concavehull()'s chi_factor -- chi_factor "
+	    "is normalized to [0, 1], but chi is an unbounded multiplier on the "
+	    "edge-length standard deviation (lambda = mu + chi*sigma, Eq. 4 of the "
+	    "paper); the two papers just reuse the same Greek letter for "
+	    "differently-scaled parameters. Use length_to_chi()/chi_to_length() to "
+	    "convert to/from an actual edge-length threshold for a given point set, "
+	    "and max_meaningful_chi() to find where chi saturates to the convex hull.")
 	    .def(py::init(&make_chioutline), py::arg("pts"), py::arg("chi") = 0.1)
 	    .def("compute", &pychioutline_compute,
 	         "Run the algorithm, returning a list of Nx2 arrays, one per "
-	         "disconnected polygon found.");
+	         "disconnected polygon found.")
+	    .def_static("chi_to_length", &pychioutline_length_for_chi, py::arg("pts"), py::arg("chi"),
+	         "Convert chi to the corresponding edge-length threshold "
+	         "lambda = mu + chi*sigma for `pts`'s whole Delaunay triangulation "
+	         "(Eq. 4, at chi-outline's initial single-component state).")
+	    .def_static("length_to_chi", &pychioutline_chi_for_length, py::arg("pts"), py::arg("length"),
+	         "Inverse of chi_to_length(): the chi value whose edge-length "
+	         "threshold for `pts` equals `length`.")
+	    .def_static("max_meaningful_chi", &pychioutline_max_meaningful_chi, py::arg("pts"),
+	         "The data-dependent chi value at/beyond which chi-outline "
+	         "saturates to the convex hull of `pts`, per the paper's own bound "
+	         "chi >= (max(DT_b) - mu_DT) / sigma_DT.");
 
 	py::class_<SplitCriterion, std::shared_ptr<SplitCriterion>>(m, "SplitCriterion",
 	    "Abstract shape-classification criterion: decides whether a polygon "

@@ -429,3 +429,92 @@ inline std::vector<std::vector<double>> ChiOutline::compute() {
 
 	return extract_polygons();
 }
+
+// --- chi <-> length-parameter conversion -----------------------------------
+//
+// chi-outline's chi is NOT the same kind of quantity as chi-shape's
+// chi_factor. chi-shape's chi_factor in [0, 1] is a linear interpolation
+// fraction between the DT's min and max edge length (Duckham et al. 2008,
+// Eq. 1): lambda = chi_factor * max(DT) + (1 - chi_factor) * min(DT).
+// chi-outline's chi, by contrast, is a multiplier on the edge-length standard
+// deviation (Zhong & Duckham 2016, Eq. 4): lambda_C = mu_C + chi * sigma_bar.
+// It is legitimately unbounded -- the paper's own experiments sweep it from
+// 0 to 2, and the paper states the algorithm "returns the convex hull when
+// chi >= (max(DT_b) - mu_DT) / sigma_DT", a bound that is itself often > 1.
+// These two papers simply reuse the same Greek letter for differently-scaled
+// parameters; this is not a bug in either chi_shape's chi_factor or
+// ChiOutline's chi, just a notation clash between the two source papers.
+//
+// The functions below convert between chi and an actual edge-length
+// threshold (the "length parameter" lambda) for a given point set, inverting
+// Eq. 4 at chi-outline's starting point (the whole point set as a single
+// connected component, i.e. mu_C = mu_DT and sigma_bar = sigma_DT -- the only
+// point at which "the" mu/sigma are unambiguous, since later components get
+// their own, different statistics as the algorithm recurses and splits).
+
+struct ChiOutlineDTStats {
+	double mu;                // mean length of all DT edges
+	double sigma;             // stddev of length of all DT edges
+	double max_boundary_edge; // longest exterior (convex hull) edge
+};
+
+inline ChiOutlineDTStats chi_outline_dt_stats(const std::vector<double>& coords) {
+	std::vector<double> coords_copy = coords;
+	std::span<double> span(coords_copy);
+	delaunator::Delaunator d(span);
+
+	size_t n_triangles = d.triangles.size() / 3;
+	std::vector<double> lengths;
+	lengths.reserve(n_triangles * 3);
+	for (size_t t = 0; t < n_triangles; ++t) {
+		for (int k = 0; k < 3; ++k) {
+			size_t he = 3 * t + k;
+			size_t twin = d.halfedges[he];
+			if (twin == delaunator::INVALID_INDEX || he < twin) {
+				lengths.push_back(edge_length(d, he));
+			}
+		}
+	}
+	double mu = 0.0;
+	for (double l : lengths) mu += l;
+	mu /= std::max<size_t>(lengths.size(), 1);
+	double var = 0.0;
+	for (double l : lengths) var += (l - mu) * (l - mu);
+	var /= std::max<size_t>(lengths.size(), 1);
+
+	std::vector<size_t> hull_pts = get_hull_points(d);
+	if (!hull_pts.empty()) hull_pts.pop_back();
+	double max_boundary_edge = 0.0;
+	for (size_t p : hull_pts) {
+		max_boundary_edge = std::max(max_boundary_edge, edge_length(d, d.hull_tri[p]));
+	}
+
+	return {mu, std::sqrt(var), max_boundary_edge};
+}
+
+// chi -> length parameter: lambda = mu_DT + chi * sigma_DT (Eq. 4, at the
+// initial single-component state).
+inline double chi_outline_length_for_chi(const std::vector<double>& coords, double chi) {
+	ChiOutlineDTStats s = chi_outline_dt_stats(coords);
+	return s.mu + chi * s.sigma;
+}
+
+// length parameter -> chi: the inverse of the above.
+inline double chi_outline_chi_for_length(const std::vector<double>& coords, double length) {
+	ChiOutlineDTStats s = chi_outline_dt_stats(coords);
+	if (s.sigma <= 0.0) {
+		throw std::invalid_argument("degenerate point set: zero edge-length standard deviation");
+	}
+	return (length - s.mu) / s.sigma;
+}
+
+// The data-dependent chi value at/beyond which chi-outline saturates to the
+// convex hull for this point set, per the paper's own stated bound:
+// chi >= (max(DT_b) - mu_DT) / sigma_DT.
+inline double chi_outline_max_meaningful_chi(const std::vector<double>& coords) {
+	ChiOutlineDTStats s = chi_outline_dt_stats(coords);
+	if (s.sigma <= 0.0) {
+		throw std::invalid_argument("degenerate point set: zero edge-length standard deviation");
+	}
+	return (s.max_boundary_edge - s.mu) / s.sigma;
+}
