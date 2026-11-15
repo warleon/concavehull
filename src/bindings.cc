@@ -9,6 +9,9 @@
 #include "bottleneck.hpp"
 #include "chioutline.hpp"
 #include "concavehull.hpp"
+#include "dtscan.hpp"
+#include "graph_bottleneck_split.hpp"
+#include "object_cluster.hpp"
 #include "split_criterion.hpp"
 
 namespace py = pybind11;
@@ -161,6 +164,39 @@ std::vector<py::array_t<double>> pybottleneck_split_all(const BottleneckSplit& s
 	return polygons_to_py(self.split_all(flats));
 }
 
+py::array_t<int> pydtscan(const py::array_t<double>& pts, double area_z_threshold, double length_z_threshold,
+                           size_t min_pts) {
+	std::vector<Point2D> points = py_polygon_to_points(pts);
+	DTScanResult r = dtscan(points, area_z_threshold, length_z_threshold, min_pts);
+	py::array_t<int> labels((py::ssize_t)r.labels.size());
+	std::memcpy(labels.mutable_data(), r.labels.data(), r.labels.size() * sizeof(int));
+	return labels;
+}
+
+std::vector<std::vector<Point2D>> py_object_points_to_points(const std::vector<py::array_t<double>>& object_points) {
+	std::vector<std::vector<Point2D>> out;
+	out.reserve(object_points.size());
+	for (auto& pts : object_points) out.push_back(py_polygon_to_points(pts));
+	return out;
+}
+
+std::unique_ptr<ObjectClusterGraph> make_object_cluster_graph(const std::vector<py::array_t<double>>& object_points,
+                                                                double area_z_threshold, double length_z_threshold,
+                                                                size_t min_pts) {
+	return std::make_unique<ObjectClusterGraph>(py_object_points_to_points(object_points), area_z_threshold,
+	                                             length_z_threshold, min_pts);
+}
+
+std::vector<std::vector<size_t>> pyobject_cluster_graph_clusters(const ObjectClusterGraph& self) {
+	return self.clusters();
+}
+
+std::vector<std::vector<size_t>> pygraph_bottleneck_split(const GraphBottleneckSplit& self,
+                                                            const std::vector<size_t>& group,
+                                                            const ObjectClusterGraph& cluster_graph) {
+	return self.split(group, cluster_graph.graph());
+}
+
 PYBIND11_MODULE(concavehull, m) {
 	m.def("concavehull", &pyconcavehull, "Find concave hull from array of 2D points",
 	      py::arg("pts"), py::arg("chi_factor") = 0.1);
@@ -288,4 +324,75 @@ PYBIND11_MODULE(concavehull, m) {
 	    .def("split_all", &pybottleneck_split_all, py::arg("polygons"),
 	         "Split every polygon in a list (e.g. ChiOutline.compute() output) "
 	         "and return the flattened result.");
+
+	m.def("dtscan", &pydtscan, py::arg("pts"), py::arg("area_z_threshold") = 1.0,
+	      py::arg("length_z_threshold") = 1.0, py::arg("min_pts") = 3,
+	      "DTSCAN (Kim & Cho, 2019, Sensors 19(18), 3926), implemented exactly "
+	      "as published: builds the Delaunay triangulation, discards triangles "
+	      "whose own area z-score or longest-edge length z-score (each "
+	      "computed globally, over the WHOLE triangulation) exceeds "
+	      "area_z_threshold/length_z_threshold, then runs DBSCAN's own "
+	      "region-growing over the survivors using triangulation-adjacency as "
+	      "the neighbor relation in place of DBSCAN's usual fixed-radius ball "
+	      "query (min_pts is DBSCAN's MinPts). Returns one cluster label per "
+	      "input point (-1 for noise/unclustered points). A plain point "
+	      "-clustering algorithm with no notion of objects -- see "
+	      "ObjectClusterGraph for the object-aware adaptation used elsewhere "
+	      "in this package.");
+
+	py::class_<ObjectClusterGraph>(m, "ObjectClusterGraph",
+	    "Object-level adaptation of dtscan() for a collection of already"
+	    "-detected, individuated objects (e.g. berries from an ML model) "
+	    "instead of raw points -- NOT part of DTSCAN itself, which has no "
+	    "notion of objects. `object_points[k]` is object k's own point set: "
+	    "a single centroid (coarse/fast mode) or its own full contour "
+	    "(shape-aware mode) both work identically, since a centroid is just "
+	    "a size-1 point set. Every object's points are pooled, tagged by "
+	    "source object, and run through dtscan() unmodified; each object's "
+	    "cluster membership is the majority vote of its own points' labels "
+	    "(an object with no clustered points becomes its own singleton "
+	    "group, never silently dropped). Also builds the UNFILTERED "
+	    "object-level proximity graph (every inter-object Delaunay edge's "
+	    "own raw distance) that GraphBottleneckSplit needs to further refine "
+	    "any cluster here that still looks like multiple merged objects.")
+	    .def(py::init(&make_object_cluster_graph), py::arg("object_points"), py::arg("area_z_threshold") = 1.0,
+	         py::arg("length_z_threshold") = 1.0, py::arg("min_pts") = 3)
+	    .def("clusters", &pyobject_cluster_graph_clusters,
+	         "The DTSCAN clustering, aggregated to object level: a list of "
+	         "lists of object indices, covering every object exactly once.");
+
+	py::class_<GraphSplitCriterion, std::shared_ptr<GraphSplitCriterion>>(m, "GraphSplitCriterion",
+	    "Abstract criterion deciding whether a group of objects still looks "
+	    "like multiple merged objects that GraphBottleneckSplit should cut "
+	    "further. The graph-level analogue of SplitCriterion.")
+	    .def("should_split", &GraphSplitCriterion::should_split, py::arg("group"), py::arg("graph"));
+
+	py::class_<GraphBottleneckCostCriterion, GraphSplitCriterion, std::shared_ptr<GraphBottleneckCostCriterion>>(
+	    m, "GraphBottleneckCostCriterion",
+	    "Default criterion: cost = min_cut_weight / min(|A|, |B|) for the "
+	    "best ratio-normalized cut of the group's induced affinity graph "
+	    "(affinity = 1/distance) -- the direct graph analogue of "
+	    "BottleneckCostCriterion's arc-fraction-normalized cost. Splits only "
+	    "if cost < cost_threshold AND both resulting sides have at least "
+	    "min_group_fraction * |group| objects (the graph analogue of "
+	    "min_arc_fraction).")
+	    .def(py::init<double, double>(), py::arg("cost_threshold") = 0.45, py::arg("min_group_fraction") = 0.1);
+
+	py::class_<GraphBottleneckSplit>(m, "GraphBottleneckSplit",
+	    "Graph-level generalization of BottleneckSplit for a cluster of "
+	    "already-detected, individuated objects (ObjectClusterGraph), "
+	    "instead of a polygon boundary. Recursively cuts a group of object "
+	    "indices at its narrowest graph connection -- a minimum cut of the "
+	    "group's own induced affinity graph, found via best_ratio_cut "
+	    "(stoer_wagner.hpp) rather than a plain global min cut, which is "
+	    "biased toward isolating a tiny corner instead of a balanced "
+	    "separating cut -- for as long as `criterion` says the group still "
+	    "looks merged. No polygon geometry is involved: output is purely a "
+	    "partition of object indices, covering every object exactly once.")
+	    .def(py::init<std::shared_ptr<GraphSplitCriterion>, int>(), py::arg("criterion") = nullptr,
+	         py::arg("max_depth") = 12)
+	    .def("split", &pygraph_bottleneck_split, py::arg("group"), py::arg("cluster_graph"),
+	         "Recursively split `group` (a list of object indices into "
+	         "`cluster_graph`) into final sub-groups, returned as a list of "
+	         "lists of object indices.");
 }
