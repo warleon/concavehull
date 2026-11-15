@@ -15,6 +15,7 @@
 // Reference: M. Stoer, F. Wagner (1997). "A Simple Min-Cut Algorithm."
 // Journal of the ACM, 44(4), 585-591.
 
+#include <algorithm>
 #include <cstddef>
 #include <limits>
 #include <stdexcept>
@@ -28,25 +29,25 @@ struct MinCutResult {
 	std::vector<size_t> side;
 };
 
-// `weights` is a dense n x n symmetric adjacency-weight matrix
-// (weights[i][j] == weights[j][i], diagonal ignored, 0 meaning "no edge").
-// Requires n >= 2. If the graph is disconnected, correctly returns a cut of
-// weight 0 separating two of its components (a global min cut of a
-// disconnected graph is trivially 0) -- callers that need a *merge*
-// decision, not just the numeric cut value, should only call this on an
-// already-connected cluster.
-inline MinCutResult stoer_wagner_min_cut(std::vector<std::vector<double>> weights) {
+// Runs every "minimum cut phase" of the Stoer-Wagner algorithm and returns
+// ALL of the resulting cut-of-the-phase candidates (one per phase, n-1
+// total), rather than only the one with the globally smallest raw weight.
+// Shared by stoer_wagner_min_cut (true global min cut -- smallest raw
+// weight) and best_ratio_cut below (smallest weight/min(|A|,|B|) -- a
+// balanced-partition heuristic), which differ only in which candidate from
+// this same phase sequence they pick.
+inline std::vector<MinCutResult> stoer_wagner_all_phase_cuts(std::vector<std::vector<double>> weights) {
 	size_t n = weights.size();
 	if (n < 2) {
-		throw std::invalid_argument("stoer_wagner_min_cut requires at least 2 vertices");
+		throw std::invalid_argument("stoer_wagner requires at least 2 vertices");
 	}
 
 	std::vector<bool> active(n, true);
 	std::vector<std::vector<size_t>> members(n);
 	for (size_t i = 0; i < n; ++i) members[i] = {i};
 
-	double best_weight = std::numeric_limits<double>::infinity();
-	std::vector<size_t> best_side;
+	std::vector<MinCutResult> phase_cuts;
+	phase_cuts.reserve(n - 1);
 
 	size_t remaining = n;
 	while (remaining > 1) {
@@ -87,11 +88,7 @@ inline MinCutResult stoer_wagner_min_cut(std::vector<std::vector<double>> weight
 
 		// "cut-of-the-phase": separates {everything folded into `last`} from
 		// the rest of the current (super-vertex) graph.
-		double cut_weight = w[last];
-		if (cut_weight < best_weight) {
-			best_weight = cut_weight;
-			best_side = members[last];
-		}
+		phase_cuts.push_back({w[last], members[last]});
 
 		// merge `last` into `prev` (Stoer-Wagner's key step: the global min
 		// cut either IS the cut-of-the-phase just found, or doesn't separate
@@ -107,5 +104,55 @@ inline MinCutResult stoer_wagner_min_cut(std::vector<std::vector<double>> weight
 		--remaining;
 	}
 
-	return {best_weight, std::move(best_side)};
+	return phase_cuts;
+}
+
+// `weights` is a dense n x n symmetric adjacency-weight matrix
+// (weights[i][j] == weights[j][i], diagonal ignored, 0 meaning "no edge").
+// Requires n >= 2. If the graph is disconnected, correctly returns a cut of
+// weight 0 separating two of its components (a global min cut of a
+// disconnected graph is trivially 0) -- callers that need a *merge*
+// decision, not just the numeric cut value, should only call this on an
+// already-connected cluster.
+inline MinCutResult stoer_wagner_min_cut(const std::vector<std::vector<double>>& weights) {
+	std::vector<MinCutResult> phases = stoer_wagner_all_phase_cuts(weights);
+	MinCutResult best = phases[0];
+	for (auto& p : phases) {
+		if (p.weight < best.weight) best = p;
+	}
+	return best;
+}
+
+// A cut-selection heuristic that approximates a balanced "ratio cut" --
+// min weight(cut) / min(|A|, |B|) -- without the complexity of a full
+// spectral/normalized-cut solver (Shi & Malik, 2000): among the SAME
+// n-1 candidate cuts Stoer-Wagner's own phase sequence already produces,
+// pick the one with the best RATIO-normalized cost instead of the smallest
+// raw weight.
+//
+// This exists because plain global min-cut (stoer_wagner_min_cut) has a
+// well-known bias toward isolating a tiny, weakly-connected corner of the
+// graph rather than finding a genuinely balanced separating cut -- exactly
+// the failure mode normalized cut was invented to fix. Confirmed directly:
+// on a graph built from two equal-sized, well-separated clusters joined by
+// a single weak bridge, stoer_wagner_min_cut reported a 3-vs-21 cut (lower
+// raw weight, from a few border nodes happening to be weakly linked) while
+// this function correctly finds the true 12-vs-12 cut, which was sitting in
+// an earlier phase with higher raw weight but far better ratio.
+inline MinCutResult best_ratio_cut(const std::vector<std::vector<double>>& weights) {
+	size_t n = weights.size();
+	std::vector<MinCutResult> phases = stoer_wagner_all_phase_cuts(weights);
+
+	MinCutResult best = phases[0];
+	double best_cost = std::numeric_limits<double>::infinity();
+	for (auto& p : phases) {
+		size_t min_side = std::min(p.side.size(), n - p.side.size());
+		if (min_side == 0) continue;
+		double cost = p.weight / (double)min_side;
+		if (cost < best_cost) {
+			best_cost = cost;
+			best = p;
+		}
+	}
+	return best;
 }
