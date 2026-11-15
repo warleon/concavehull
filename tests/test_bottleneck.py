@@ -7,6 +7,7 @@ import pytest
 from concavehull import (
     BottleneckCostCriterion,
     BottleneckSplit,
+    ChiOutline,
     ConvexDeficitCriterion,
     ConvexHullL2Criterion,
     concavehull,
@@ -204,11 +205,84 @@ def test_multi_bend_cut_produces_one_piece_per_pocket():
     assert_split_is_geometrically_valid(poly, pieces)
 
 
+def _lobed_bunches_point_cloud(seed=0):
+    # Several widely-separated clusters, each itself a tight cluster of small
+    # overlapping circular "berries" -- simulates a mask-derived grape-bunch
+    # contour, whose organic boundary has many small lobes (one per berry)
+    # that look geometrically like non-convex "necks" even though they are
+    # not separate touching objects. Directly reproduces the over-
+    # segmentation observed with a real mask-contour pipeline (ChiOutline +
+    # BottleneckSplit on grape-cluster detections): the geometric split
+    # criteria cannot tell a real neck between two bunches from a single
+    # bunch's own berry-lobe boundary noise, so unconstrained recursion
+    # chips off dozens of near-zero-area sliver pieces.
+    rng = np.random.default_rng(seed)
+    bunch_centers = [(0, 0), (12, 1), (1, 13), (13, 13), (25, 2), (24, 14)]
+    berry_radius = 0.9
+
+    def make_bunch(center):
+        pts = []
+        for _ in range(12):
+            bc = center + rng.normal(scale=0.9, size=2)
+            theta = rng.uniform(0, 2 * np.pi, 25)
+            r = berry_radius * np.sqrt(rng.uniform(0.6, 1.0, 25))
+            pts.append(bc + np.stack([r * np.cos(theta), r * np.sin(theta)], axis=1))
+        return np.vstack(pts)
+
+    pts = np.vstack([make_bunch(np.array(c, dtype=float)) for c in bunch_centers])
+    return pts, len(bunch_centers), berry_radius
+
+
+def test_min_piece_area_rejects_degenerate_sliver_splits():
+    pts, _n_true_bunches, berry_radius = _lobed_bunches_point_cloud()
+    co = ChiOutline(pts, chi=ChiOutline.elbow_chi(pts))
+    regions = co.compute()
+
+    # Isolate a single lobed-bunch region (the largest one) so this test is
+    # about BottleneckSplit's own recursive over-splitting specifically, not
+    # conflated with ChiOutline's separate (and separately-scoped) tendency
+    # to also carve stray noise regions out of this same point cloud.
+    region = max(regions, key=lambda r: polygon_area(np.asarray(r)))
+
+    bs_unconstrained = BottleneckSplit(BottleneckCostCriterion(0.45))
+    pieces_unconstrained = bs_unconstrained.split(region)
+
+    # Unconstrained, recursion chips this one lobed boundary into far more
+    # pieces than a single bunch warrants -- confirms this scenario actually
+    # reproduces the over-segmentation this test guards against.
+    assert len(pieces_unconstrained) > 5
+
+    min_piece_area = 0.2 * (np.pi * berry_radius**2)
+    bs_constrained = BottleneckSplit(BottleneckCostCriterion(0.45), min_piece_area=min_piece_area)
+    pieces_constrained = bs_constrained.split(region)
+
+    # No piece produced BY A SPLIT may be smaller than the floor; the floor
+    # should reject essentially all of the spurious extra pieces chipped off
+    # a single bunch's own boundary noise.
+    for p in pieces_constrained:
+        assert polygon_area(np.asarray(p)) >= min_piece_area
+    assert len(pieces_constrained) < len(pieces_unconstrained)
+
+    # Rejecting a split must fall back to re-emitting the untouched input
+    # piece, never dropping or duplicating area.
+    total_piece_area = sum(polygon_area(np.asarray(p)) for p in pieces_constrained)
+    assert total_piece_area == pytest.approx(polygon_area(np.asarray(region)), rel=1e-9)
+
+
+def test_min_piece_area_does_not_block_a_genuine_split():
+    hull = two_overlapping_blobs()
+    bs = BottleneckSplit(min_piece_area=1.0)  # far below either real piece's area
+    pieces = bs.split(hull)
+    assert len(pieces) == 2
+
+
 def test_rejects_invalid_constructor_arguments():
     with pytest.raises(Exception):
         BottleneckSplit(min_arc_fraction=0.0)
     with pytest.raises(Exception):
         BottleneckSplit(min_arc_fraction=0.5)
+    with pytest.raises(Exception):
+        BottleneckSplit(min_piece_area=-0.1)
     with pytest.raises(Exception):
         ConvexDeficitCriterion(deficit_threshold=1.0)
     with pytest.raises(Exception):

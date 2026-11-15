@@ -41,16 +41,35 @@
 
 class BottleneckSplit {
 public:
+	// `min_piece_area` rejects any candidate split that would produce a piece
+	// smaller than this (absolute, same units as the input polygon's
+	// coordinates -- e.g. pixels^2 for a mask-derived polygon). Default 0.0
+	// disables the check entirely, preserving old behavior. This matters
+	// because `should_split`'s geometric criteria can't distinguish a real
+	// neck between two touching objects from the small non-convex notches a
+	// single object's own *organic* boundary naturally has (e.g. individual
+	// berries bulging within one mask-derived grape-bunch contour) -- left
+	// unchecked, recursion keeps chipping near-zero-area slivers off such a
+	// boundary indefinitely (observed directly: dozens of sub-1%-area
+	// fragments from a single lobed input polygon). A non-zero floor turns
+	// "this split would produce a sliver" into the same kind of rejection as
+	// the existing no-diagonal/no-bottleneck-pair fallbacks below, rather
+	// than a hard vertex-count/depth cutoff that a lobed-but-small polygon
+	// can still slip past.
 	explicit BottleneckSplit(std::shared_ptr<SplitCriterion> criterion = nullptr, double min_arc_fraction = 0.1,
-	                          int max_depth = 12)
+	                          int max_depth = 12, double min_piece_area = 0.0)
 		: criterion_(criterion ? std::move(criterion) : std::make_shared<BottleneckCostCriterion>()),
 		  min_arc_fraction_(min_arc_fraction),
-		  max_depth_(max_depth) {
+		  max_depth_(max_depth),
+		  min_piece_area_(min_piece_area) {
 		if (min_arc_fraction_ <= 0.0 || min_arc_fraction_ >= 0.5) {
 			throw std::invalid_argument("min_arc_fraction must be in (0, 0.5)");
 		}
 		if (max_depth_ < 0) {
 			throw std::invalid_argument("max_depth must be non-negative");
+		}
+		if (min_piece_area_ < 0.0) {
+			throw std::invalid_argument("min_piece_area must be non-negative");
 		}
 	}
 
@@ -84,6 +103,7 @@ private:
 	std::shared_ptr<SplitCriterion> criterion_;
 	double min_arc_fraction_;
 	int max_depth_;
+	double min_piece_area_;
 
 	static std::vector<Point2D> to_points(const std::vector<double>& flat) {
 		std::vector<Point2D> pts;
@@ -155,6 +175,15 @@ private:
 		}
 
 		std::vector<std::vector<double>> pieces = split_polygon_along_path(pts, cut_path);
+
+		if (min_piece_area_ > 0.0) {
+			for (auto& piece_flat : pieces) {
+				if (polygon_area(to_points(piece_flat)) < min_piece_area_) {
+					out.push_back(to_flat(pts));  // this cut would create a degenerate sliver -- reject it
+					return;
+				}
+			}
+		}
 
 		for (auto& piece_flat : pieces) {
 			split_recursive(to_points(piece_flat), depth + 1, out);

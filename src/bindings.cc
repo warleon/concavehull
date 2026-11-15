@@ -219,9 +219,17 @@ PYBIND11_MODULE(concavehull, m) {
 	    "boundary points minimizing dist(A,B) / min(arc(A,B), arc(B,A)) -- "
 	    "for as long as `criterion` says the result still looks like a clump. "
 	    "Feed it polygons built with a moderate-to-high chi/chi_factor "
-	    "(~0.5+) -- see BottleneckCostCriterion's docstring for why.")
-	    .def(py::init<std::shared_ptr<SplitCriterion>, double, int>(),
-	         py::arg("criterion") = nullptr, py::arg("min_arc_fraction") = 0.1, py::arg("max_depth") = 12)
+	    "(~0.5+) -- see BottleneckCostCriterion's docstring for why. "
+	    "`min_piece_area` (default 0.0, disabled) rejects any candidate cut "
+	    "that would produce a piece smaller than this (same units as the "
+	    "input polygon's own coordinates, e.g. pixels^2 for a mask-derived "
+	    "polygon) -- useful because the geometric criteria can mistake a "
+	    "single object's own organic boundary lobes (e.g. individual grape "
+	    "berries bulging within one mask contour) for real necks, otherwise "
+	    "chipping it into many near-zero-area sliver pieces.")
+	    .def(py::init<std::shared_ptr<SplitCriterion>, double, int, double>(),
+	         py::arg("criterion") = nullptr, py::arg("min_arc_fraction") = 0.1, py::arg("max_depth") = 12,
+	         py::arg("min_piece_area") = 0.0)
 	    .def("split", &pybottleneck_split, py::arg("polygon"),
 	         "Split a single polygon (Nx2 array) into sub-polygons.")
 	    .def("split_all", &pybottleneck_split_all, py::arg("polygons"),
