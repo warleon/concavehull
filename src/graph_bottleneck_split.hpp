@@ -19,13 +19,24 @@
 // -cut solver, mirroring the standard affinity-weighting used in
 // spectral/graph-based clustering.
 //
-// Specifically uses best_ratio_cut, not the plain global min cut: a plain
-// min cut is well known to prefer isolating a tiny, weakly-connected corner
-// of the graph over finding a genuinely balanced separating cut -- verified
-// directly on a two-equal-size-cluster test case, where stoer_wagner_min_cut
-// reported a 3-vs-21 split (lower raw weight) while best_ratio_cut correctly
-// found the true 12-vs-12 split sitting in an earlier phase. See
-// best_ratio_cut's own comment in stoer_wagner.hpp for the full reasoning.
+// Specifically uses best_normalized_cut, not the plain global min cut or
+// the cardinality-normalized best_ratio_cut: a plain min cut is well known
+// to prefer isolating a tiny, weakly-connected corner of the graph over
+// finding a genuinely balanced separating cut -- verified directly on a
+// two-equal-size-cluster test case, where stoer_wagner_min_cut reported a
+// 3-vs-21 split (lower raw weight) instead of the true 12-vs-12 split.
+// best_ratio_cut (weight/min(|A|,|B|)) fixes that specific case, but its
+// cardinality-based normalization is NOT scale-invariant for an affinity
+// -weighted graph: uniformly rescaling every input coordinate (e.g. moving
+// from a small synthetic test scale to real pixel-scale image coordinates)
+// shrinks every 1/distance affinity without changing the object count,
+// silently drifting the same cost_threshold out of calibration -- verified
+// directly: an intact single bunch of synthetic berries was left alone at
+// one coordinate scale, then spuriously split apart at a 20x larger
+// (otherwise identical) layout. best_normalized_cut's association-based
+// ratio (Shi & Malik's own Ncut denominator) cancels that scale factor out.
+// See best_normalized_cut's own comment in stoer_wagner.hpp for the full
+// reasoning.
 //
 // Mirrors BottleneckSplit's own recursive shape and SplitCriterion pattern
 // exactly (should-I-split, then cut, then recurse on each resulting piece),
@@ -46,11 +57,13 @@
 #include "stoer_wagner.hpp"
 
 // Converts a distance-weighted induced subgraph (restricted to `group`'s own
-// objects) into an affinity-weighted dense matrix and finds its global min
-// cut via Stoer-Wagner. Returns the cut weight (affinity units) and a
+// objects) into an affinity-weighted dense matrix and finds its best
+// normalized cut via Stoer-Wagner. Returns the cut weight (affinity units),
+// its normalized-cut cost (scale-invariant; see best_normalized_cut), and a
 // GLOBAL-object-id partition of `group` into two non-empty parts.
 struct GraphMinCut {
 	double weight;
+	double cost;
 	std::vector<size_t> side_a;
 	std::vector<size_t> side_b;
 };
@@ -79,13 +92,14 @@ inline GraphMinCut graph_min_cut(const std::vector<size_t>& group, const ObjectG
 		}
 	}
 
-	MinCutResult r = best_ratio_cut(affinity);
+	MinCutResult r = best_normalized_cut(affinity);
 
 	std::vector<bool> in_side_a(k, false);
 	for (size_t local : r.side) in_side_a[local] = true;
 
 	GraphMinCut out;
 	out.weight = r.weight;
+	out.cost = r.cost;
 	for (size_t i = 0; i < k; ++i) {
 		(in_side_a[i] ? out.side_a : out.side_b).push_back(group[i]);
 	}
@@ -98,15 +112,16 @@ public:
 	virtual bool should_split(const std::vector<size_t>& group, const ObjectGraph& graph) const = 0;
 };
 
-// Default criterion: cost = min_cut_weight / min(|A|, |B|), the direct graph
-// analogue of BottleneckCostCriterion's arc-fraction normalization (there,
-// cost is normalized by the shorter boundary arc; here, by the smaller
-// resulting group's object count). should_split iff cost < cost_threshold
-// AND both resulting sides have at least min_group_fraction * |group|
-// objects (the graph analogue of min_arc_fraction).
+// Default criterion: cost = min_cut_weight / min(assoc(A,V), assoc(B,V))
+// (best_normalized_cut's own scale-invariant ratio -- see its comment in
+// stoer_wagner.hpp), the direct graph analogue of BottleneckCostCriterion's
+// arc-fraction-normalized cost. should_split iff cost < cost_threshold AND
+// both resulting sides have at least min_group_fraction * |group| objects
+// (the graph analogue of min_arc_fraction -- a count-based floor against a
+// degenerate near-empty split, independent of the cost ratio itself).
 class GraphBottleneckCostCriterion : public GraphSplitCriterion {
 public:
-	explicit GraphBottleneckCostCriterion(double cost_threshold = 0.45, double min_group_fraction = 0.1)
+	explicit GraphBottleneckCostCriterion(double cost_threshold = 0.1, double min_group_fraction = 0.1)
 		: cost_threshold_(cost_threshold), min_group_fraction_(min_group_fraction) {
 		if (cost_threshold_ < 0.0) {
 			throw std::invalid_argument("cost_threshold must be non-negative");
@@ -122,8 +137,7 @@ public:
 		size_t min_side = std::min(cut.side_a.size(), cut.side_b.size());
 		size_t required = (size_t)std::ceil(min_group_fraction_ * (double)group.size());
 		if (min_side < std::max<size_t>(required, 1)) return false;
-		double cost = cut.weight / (double)min_side;
-		return cost < cost_threshold_;
+		return cut.cost < cost_threshold_;
 	}
 
 private:

@@ -27,6 +27,13 @@ struct MinCutResult {
 	// numbering; the other side is every vertex not listed here. Which side
 	// is reported is arbitrary (Stoer-Wagner finds an unordered bipartition).
 	std::vector<size_t> side;
+	// The selection ratio used to pick this cut among candidates (0.0 for
+	// stoer_wagner_min_cut/stoer_wagner_all_phase_cuts, which select by raw
+	// weight alone and don't populate this; set by best_ratio_cut (cost =
+	// weight/min(|A|,|B|)) and best_normalized_cut (cost =
+	// weight/min(assoc(A,V),assoc(B,V))) to spare callers from recomputing
+	// their own selection criterion's value afterward).
+	double cost = 0.0;
 };
 
 // Runs every "minimum cut phase" of the Stoer-Wagner algorithm and returns
@@ -144,14 +151,61 @@ inline MinCutResult best_ratio_cut(const std::vector<std::vector<double>>& weigh
 	std::vector<MinCutResult> phases = stoer_wagner_all_phase_cuts(weights);
 
 	MinCutResult best = phases[0];
-	double best_cost = std::numeric_limits<double>::infinity();
+	best.cost = std::numeric_limits<double>::infinity();
 	for (auto& p : phases) {
 		size_t min_side = std::min(p.side.size(), n - p.side.size());
 		if (min_side == 0) continue;
 		double cost = p.weight / (double)min_side;
-		if (cost < best_cost) {
-			best_cost = cost;
+		if (cost < best.cost) {
 			best = p;
+			best.cost = cost;
+		}
+	}
+	return best;
+}
+
+// Shi & Malik's own normalized-cut ratio: cut_weight / min(assoc(A,V),
+// assoc(B,V)), where assoc(X,V) = the sum of every edge weight with at
+// least one endpoint in X (each node's own total degree, summed over X).
+// `cost` on the returned result is that ratio, for callers that need it
+// (e.g. a should-I-split-further threshold) without recomputing it.
+//
+// Unlike best_ratio_cut's cardinality-based normalization (min(|A|,|B|)),
+// this ratio is properly SCALE-INVARIANT for affinity-weighted graphs built
+// from distances (e.g. 1/distance, as graph_bottleneck_split.hpp uses):
+// uniformly rescaling every distance by a constant factor k scales every
+// weight by 1/k, which scales both cut_weight and assoc(X,V) by 1/k
+// identically, leaving their ratio unchanged. A count-based ratio has no
+// such cancellation (object count doesn't scale with distance at all), so
+// it silently drifts out of calibration as soon as the input's absolute
+// coordinate scale changes -- confirmed directly: a GraphBottleneckSplit
+// built on best_ratio_cut correctly left an intact single bunch of
+// synthetic berries alone at one coordinate scale, then spuriously split it
+// apart at a 20x larger (but otherwise identical, just uniformly rescaled)
+// layout, purely because 1/distance affinities shrink with scale while a
+// bare object count does not.
+inline MinCutResult best_normalized_cut(const std::vector<std::vector<double>>& weights) {
+	size_t n = weights.size();
+	std::vector<double> degree(n, 0.0);
+	for (size_t i = 0; i < n; ++i) {
+		for (size_t j = 0; j < n; ++j) degree[i] += weights[i][j];
+	}
+	double total_assoc = 0.0;
+	for (double d : degree) total_assoc += d;
+
+	std::vector<MinCutResult> phases = stoer_wagner_all_phase_cuts(weights);
+	MinCutResult best = phases[0];
+	best.cost = std::numeric_limits<double>::infinity();
+	for (auto& p : phases) {
+		double assoc_a = 0.0;
+		for (size_t i : p.side) assoc_a += degree[i];
+		double assoc_b = total_assoc - assoc_a;
+		double min_assoc = std::min(assoc_a, assoc_b);
+		if (min_assoc <= 0.0) continue;
+		double cost = p.weight / min_assoc;
+		if (cost < best.cost) {
+			best = p;
+			best.cost = cost;
 		}
 	}
 	return best;

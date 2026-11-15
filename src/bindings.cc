@@ -369,24 +369,28 @@ PYBIND11_MODULE(concavehull, m) {
 
 	py::class_<GraphBottleneckCostCriterion, GraphSplitCriterion, std::shared_ptr<GraphBottleneckCostCriterion>>(
 	    m, "GraphBottleneckCostCriterion",
-	    "Default criterion: cost = min_cut_weight / min(|A|, |B|) for the "
-	    "best ratio-normalized cut of the group's induced affinity graph "
-	    "(affinity = 1/distance) -- the direct graph analogue of "
-	    "BottleneckCostCriterion's arc-fraction-normalized cost. Splits only "
+	    "Default criterion: cost = min_cut_weight / min(assoc(A,V), assoc(B,V)) "
+	    "for the best normalized cut of the group's induced affinity graph "
+	    "(affinity = 1/distance; assoc(X,V) = total affinity-weighted degree "
+	    "of side X) -- the direct graph analogue of BottleneckCostCriterion's "
+	    "arc-fraction-normalized cost, and scale-invariant the same way that "
+	    "one is (see best_normalized_cut in the C++ source for why a plain "
+	    "object-count normalization is NOT scale-invariant here). Splits only "
 	    "if cost < cost_threshold AND both resulting sides have at least "
 	    "min_group_fraction * |group| objects (the graph analogue of "
 	    "min_arc_fraction).")
-	    .def(py::init<double, double>(), py::arg("cost_threshold") = 0.45, py::arg("min_group_fraction") = 0.1);
+	    .def(py::init<double, double>(), py::arg("cost_threshold") = 0.1, py::arg("min_group_fraction") = 0.1);
 
 	py::class_<GraphBottleneckSplit>(m, "GraphBottleneckSplit",
 	    "Graph-level generalization of BottleneckSplit for a cluster of "
 	    "already-detected, individuated objects (ObjectClusterGraph), "
 	    "instead of a polygon boundary. Recursively cuts a group of object "
 	    "indices at its narrowest graph connection -- a minimum cut of the "
-	    "group's own induced affinity graph, found via best_ratio_cut "
-	    "(stoer_wagner.hpp) rather than a plain global min cut, which is "
-	    "biased toward isolating a tiny corner instead of a balanced "
-	    "separating cut -- for as long as `criterion` says the group still "
+	    "group's own induced affinity graph, found via best_normalized_cut "
+	    "(stoer_wagner.hpp) rather than a plain global min cut (biased toward "
+	    "isolating a tiny corner instead of a balanced separating cut) or a "
+	    "cardinality-normalized ratio cut (not scale-invariant for an "
+	    "affinity graph) -- for as long as `criterion` says the group still "
 	    "looks merged. No polygon geometry is involved: output is purely a "
 	    "partition of object indices, covering every object exactly once.")
 	    .def(py::init<std::shared_ptr<GraphSplitCriterion>, int>(), py::arg("criterion") = nullptr,
