@@ -5,6 +5,7 @@
 #include <pybind11/stl.h>
 #include <vector>
 
+#include "alpha_outline.hpp"
 #include "bottleneck.hpp"
 #include "chioutline.hpp"
 #include "concavehull.hpp"
@@ -113,6 +114,39 @@ double pychioutline_elbow_chi(const py::array_t<double>& pts) {
 	return chi_outline_elbow_chi(py_polygon_to_flat(pts));
 }
 
+py::dict polygon_with_holes_to_py(const PolygonWithHoles& pwh) {
+	py::dict d;
+	d["exterior"] = polygons_to_py({pwh.exterior})[0];
+	py::list holes_list;
+	for (auto& h : polygons_to_py(pwh.holes)) holes_list.append(h);
+	d["holes"] = holes_list;
+	return d;
+}
+
+std::unique_ptr<AlphaOutline> make_alpha_outline(const py::array_t<double>& pts, double chi) {
+	py::buffer_info buf = pts.request();
+
+	if (buf.ndim != 2) {
+		throw std::runtime_error("Number of dimensions must be two");
+	}
+
+	if (buf.shape[1] != 2) {
+		throw std::runtime_error("Second dimension's size must be two");
+	}
+
+	double *ptr = static_cast<double *>(buf.ptr);
+	std::vector<double> coords(ptr, ptr + buf.size);
+
+	// Same non-movable-must-construct-in-place reasoning as ChiOutline.
+	return std::make_unique<AlphaOutline>(coords, chi);
+}
+
+std::vector<py::dict> pyalpha_outline_compute(const AlphaOutline& self) {
+	std::vector<py::dict> out;
+	for (auto& pwh : self.compute()) out.push_back(polygon_with_holes_to_py(pwh));
+	return out;
+}
+
 std::vector<py::array_t<double>> pybottleneck_split(const BottleneckSplit& self, const py::array_t<double>& polygon) {
 	return polygons_to_py(self.split(py_polygon_to_flat(polygon)));
 }
@@ -165,6 +199,25 @@ PYBIND11_MODULE(concavehull, m) {
 	         "converts that length to chi. Unlike a heuristic based on some "
 	         "externally-supplied scale (e.g. an object's bounding-box size), "
 	         "this can't be mismatched against this point cloud's own spacing.");
+
+	py::class_<AlphaOutline>(m, "AlphaOutline",
+	    "Delaunay-triangulation-based outline extraction (alpha-shape family, "
+	    "Edelsbrunner, Kirkpatrick & Seidel 1983; one-shot triangulate-filter-"
+	    "extract pipeline in the same shape as Polylidar, Castagno & Atkins "
+	    "2020) that keeps interior holes instead of forcing a single simple "
+	    "polygon per region the way ChiOutline deliberately does. Same "
+	    "lambda = mu + chi*sigma threshold formula/parameter as ChiOutline, "
+	    "for familiarity, but estimated once globally -- unlike ChiOutline, "
+	    "this does NOT adapt to very different point densities within a "
+	    "single call. A single global chi can also carve small spurious "
+	    "holes out of a dense-but-not-perfectly-uniform blob (a known "
+	    "characteristic of alpha shapes in general, not a bug) -- tune chi "
+	    "down, or prefer ChiOutline, when that matters more than hole support.")
+	    .def(py::init(&make_alpha_outline), py::arg("pts"), py::arg("chi") = 0.1)
+	    .def("compute", &pyalpha_outline_compute,
+	         "Run the algorithm, returning a list of "
+	         "{'exterior': Nx2 array, 'holes': list of Nx2 arrays} dicts, "
+	         "one per disconnected region.");
 
 	py::class_<SplitCriterion, std::shared_ptr<SplitCriterion>>(m, "SplitCriterion",
 	    "Abstract shape-classification criterion: decides whether a polygon "
