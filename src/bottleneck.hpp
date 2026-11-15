@@ -14,15 +14,18 @@
 //          Es(A,B) = dist(A,B) / min(arc(A,B), arc(B,A))                (Eq. 1-2)
 //      where arc(A,B)/arc(B,A) are the two boundary-path lengths between A
 //      and B, and
-//   3. cuts the polygon into two simple sub-polygons along the straight
-//      chord A*-B*.
+//   3. cuts the polygon into two simple sub-polygons along the shortest
+//      interior-respecting path between A* and B* (see interior_path.hpp).
 //
 // Step 3 in the paper finds the optimal cut via a weighted shortest path
 // over image-intensity edge strength (Eqs. 3-4), using Dijkstra's algorithm.
 // We only have polygon geometry here, no source image, so there is no
-// intensity information to route around -- which is exactly the case the
-// paper itself says the weighted shortest path "degenerates" to: the
-// straight-line cut between A* and B*.
+// intensity information to route the cut around -- interior_path.hpp instead
+// treats the polygon's own triangulated interior as the thing being routed
+// through, and finds the shortest such path via A* (edge weights = Euclidean
+// edge length). See interior_path.hpp's own header comment for the full
+// reasoning, including why this reduces to exactly the direct straight-line
+// chord whenever that chord is already a valid cut.
 //
 // Recursion continues on each resulting piece until the criterion says stop,
 // a piece gets too small to split further, or `max_depth` is reached.
@@ -33,6 +36,7 @@
 #include <utility>
 #include <vector>
 
+#include "interior_path.hpp"
 #include "split_criterion.hpp"
 
 class BottleneckSplit {
@@ -118,14 +122,42 @@ private:
 			return;
 		}
 
-		std::vector<Point2D> piece1(pts.begin() + (long)i, pts.begin() + (long)j + 1);
+		// Step 3 (Eqs. 3-4): the shortest interior-respecting path from i to j
+		// -- [i, ..., j] as vertex indices into `pts`. Reduces to exactly {i, j}
+		// (no intermediate vertices) whenever the direct chord is itself a
+		// valid cut. Then split along it by face-tracing (NOT naive arc+path
+		// concatenation -- see interior_path.hpp's header comment for why
+		// that's the one correct general construction).
+		std::vector<size_t> cut_path = find_interior_path(pts, i, j);
 
-		std::vector<Point2D> piece2;
-		piece2.reserve(pts.size() - piece1.size() + 2);
-		for (size_t k = j; k < pts.size(); ++k) piece2.push_back(pts[k]);
-		for (size_t k = 0; k <= i; ++k) piece2.push_back(pts[k]);
+		// Degenerate case: if every consecutive pair in cut_path is already an
+		// original boundary edge (no genuine diagonal anywhere along it), the
+		// path contributes NO new edge to the polygon's graph at all -- it's
+		// just retracing one of the two existing boundary arcs. There is then
+		// no actual interior cut between i and j for this pair (this (i, j)
+		// pair doesn't correspond to a real separable waist), and
+		// split_polygon_along_path would (correctly, given its input) return
+		// two copies of the entire unmodified polygon, which would otherwise
+		// recurse without ever making progress. Treat exactly like the
+		// existing "geometry can't give a split" fallback above.
+		size_t n = pts.size();
+		bool any_diagonal = false;
+		for (size_t m = 0; m + 1 < cut_path.size(); ++m) {
+			size_t a = cut_path[m], b = cut_path[m + 1];
+			if (b != (a + 1) % n && a != (b + 1) % n) {
+				any_diagonal = true;
+				break;
+			}
+		}
+		if (!any_diagonal) {
+			out.push_back(to_flat(pts));
+			return;
+		}
 
-		split_recursive(std::move(piece1), depth + 1, out);
-		split_recursive(std::move(piece2), depth + 1, out);
+		std::vector<std::vector<double>> pieces = split_polygon_along_path(pts, cut_path);
+
+		for (auto& piece_flat : pieces) {
+			split_recursive(to_points(piece_flat), depth + 1, out);
+		}
 	}
 };
