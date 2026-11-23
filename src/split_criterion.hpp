@@ -16,19 +16,14 @@
 #include <cmath>
 #include <cstddef>
 #include <limits>
+#include <map>
 #include <memory>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
-struct Point2D {
-	double x, y;
-};
-
-inline double distance(const Point2D& a, const Point2D& b) {
-	double dx = a.x - b.x;
-	double dy = a.y - b.y;
-	return std::sqrt(dx * dx + dy * dy);
-}
+#include "graph.hpp"  // Graph, EdgeWeightFn, euclidean_edge_weight, dijkstra_from
+#include "point2d.hpp"  // Point2D, distance()
 
 // Shoelace formula. Works for any simple polygon regardless of winding.
 inline double polygon_area(const std::vector<Point2D>& pts) {
@@ -123,10 +118,89 @@ inline BottleneckResult find_bottleneck(const std::vector<Point2D>& pts, double 
 	return best;
 }
 
+// Graph-accepting generalization of find_bottleneck above, for a Graph
+// (graph.hpp -- e.g. from ChiOutline::compute_graph()/AlphaOutline::
+// compute_graph()/concavehull_graph()) rather than a flat ordered polygon.
+// `boundary` is the region's own boundary cycle as a sequence of indices
+// into g.vertices (i and j below are positions WITHIN this sequence, same
+// convention as the flat-polygon overload's i/j being positions in `pts`).
+// `weight_fn` (default: Euclidean length, so this exactly reproduces the
+// flat-polygon overload's numbers when `g` is that same polygon's own
+// triangulation and `boundary` is its vertex order) replaces:
+//   - arc(A,B)/arc(B,A): cumulative weight_fn over consecutive boundary
+//     edges between positions i and j (direct generalization of cumulative
+//     Euclidean length).
+//   - dist(A,B): the shortest-path distance between boundary[i] and
+//     boundary[j] over `g`'s ENTIRE edge set (Dijkstra, graph.hpp's
+//     dijkstra_from) -- constrained strictly to g's own edges, never a
+//     straight-line bypass (see interior_path.hpp's Graph-accepting
+//     find_interior_path for why that constraint matters here).
+// Needs an EdgeWeightFn-aware edge-index lookup for the boundary-arc sums;
+// built once up front rather than per (i,j) pair.
+inline BottleneckResult find_bottleneck(const Graph& g, const std::vector<size_t>& boundary, double min_arc_fraction,
+                                         const EdgeWeightFn& weight_fn = euclidean_edge_weight) {
+	size_t n = boundary.size();
+
+	std::map<std::pair<size_t, size_t>, size_t> edge_index;
+	for (size_t e = 0; e < g.edges.size(); ++e) {
+		auto& [a, b] = g.edges[e];
+		auto key = a < b ? std::make_pair(a, b) : std::make_pair(b, a);
+		edge_index[key] = e;
+	}
+	auto boundary_edge_weight = [&](size_t pos) {
+		size_t a = boundary[pos], b = boundary[(pos + 1) % n];
+		auto key = a < b ? std::make_pair(a, b) : std::make_pair(b, a);
+		return weight_fn(g, edge_index.at(key));
+	};
+
+	std::vector<double> cum(n, 0.0);
+	for (size_t k = 1; k < n; ++k) {
+		cum[k] = cum[k - 1] + boundary_edge_weight(k - 1);
+	}
+	double perimeter = cum[n - 1] + boundary_edge_weight(n - 1);
+	double min_arc_len = min_arc_fraction * perimeter;
+
+	BottleneckResult best{std::numeric_limits<double>::infinity(), SIZE_MAX, SIZE_MAX};
+	for (size_t i = 0; i < n; ++i) {
+		std::vector<double> dist_from_i = dijkstra_from(g, boundary[i], weight_fn);
+		for (size_t j = i + 1; j < n; ++j) {
+			double arc_ij = cum[j] - cum[i];
+			double arc_ji = perimeter - arc_ij;
+			double min_arc = std::min(arc_ij, arc_ji);
+			if (min_arc < min_arc_len) continue;
+
+			size_t piece1 = j - i + 1;
+			size_t piece2 = n - piece1 + 2;
+			if (piece1 < 3 || piece2 < 3) continue;
+
+			double cost = dist_from_i[boundary[j]] / min_arc;
+			if (cost < best.cost) best = {cost, i, j};
+		}
+	}
+	return best;
+}
+
 class SplitCriterion {
 public:
 	virtual ~SplitCriterion() = default;
 	virtual bool should_split(const std::vector<Point2D>& pts) const = 0;
+
+	// Graph-aware variant, used by BottleneckSplit::split_graph(). Default
+	// implementation just extracts the boundary's own point sequence and
+	// defers to the pure-geometry overload above, so every existing
+	// criterion (BottleneckCostCriterion, ConvexDeficitCriterion, etc.)
+	// works unchanged with split_graph() with zero modification. Override
+	// this instead when a custom criterion wants direct access to the
+	// complete graph's vertex_data/edge_data -- e.g. to factor mesh
+	// connectivity into the split decision, not just boundary shape --
+	// which is exactly the "swappable criteria doing the heavy lifting"
+	// this generalization exists to allow.
+	virtual bool should_split(const Graph& g, const std::vector<size_t>& boundary) const {
+		std::vector<Point2D> pts;
+		pts.reserve(boundary.size());
+		for (size_t v : boundary) pts.push_back(g.vertices[v]);
+		return should_split(pts);
+	}
 };
 
 // Direct implementation of the chi-shape paper's L2 error norm (Duckham et

@@ -10,12 +10,15 @@
 // Graph-accepting find_interior_path, split_criterion.hpp's Graph-accepting
 // find_bottleneck) can then use in place of Euclidean edge length/1.
 
+#include <cmath>
 #include <cstddef>
 #include <functional>
+#include <limits>
+#include <queue>
 #include <utility>
 #include <vector>
 
-#include "split_criterion.hpp"  // Point2D
+#include "point2d.hpp"  // Point2D
 
 struct Graph {
 	std::vector<Point2D> vertices;
@@ -41,4 +44,60 @@ using EdgeDataFn = std::function<std::vector<double>(const Graph&)>;
 inline void annotate_graph(Graph& g, const VertexDataFn& vertex_fn, const EdgeDataFn& edge_fn) {
 	if (vertex_fn) g.vertex_data = vertex_fn(g);
 	if (edge_fn) g.edge_data = edge_fn(g);
+}
+
+// The routing weight for one of `g`'s own edges, used by the generalized
+// (Graph-accepting) find_bottleneck/find_interior_path/BottleneckSplit in
+// place of Euclidean edge length -- another custom swappable callable
+// (same reasoning as VertexDataFn/EdgeDataFn above). Defaults to
+// euclidean_edge_weight everywhere it's an optional parameter, so omitting
+// it reproduces the plain-geometry behavior exactly.
+using EdgeWeightFn = std::function<double(const Graph&, size_t edge_idx)>;
+
+inline double euclidean_edge_weight(const Graph& g, size_t edge_idx) {
+	auto& [a, b] = g.edges[edge_idx];
+	double dx = g.vertices[a].x - g.vertices[b].x;
+	double dy = g.vertices[a].y - g.vertices[b].y;
+	return std::sqrt(dx * dx + dy * dy);
+}
+
+// Single-source shortest-path distances from `source` to every vertex of
+// `g`, using `weight_fn` as each edge's weight (Dijkstra; requires
+// non-negative weights). Unreachable vertices get +infinity. Shared by the
+// Graph-accepting find_bottleneck (split_criterion.hpp) for its
+// generalized dist(A,B) -- run once per candidate source rather than once
+// per (A,B) pair, since the paper's own Eq. 1-2 already needs the distance
+// from each boundary vertex to every other one.
+inline std::vector<double> dijkstra_from(const Graph& g, size_t source, const EdgeWeightFn& weight_fn) {
+	size_t n = g.vertices.size();
+	std::vector<std::vector<std::pair<size_t, size_t>>> adjacency(n);  // (neighbor, edge_idx)
+	for (size_t e = 0; e < g.edges.size(); ++e) {
+		auto& [a, b] = g.edges[e];
+		adjacency[a].push_back({b, e});
+		adjacency[b].push_back({a, e});
+	}
+
+	std::vector<double> dist(n, std::numeric_limits<double>::infinity());
+	dist[source] = 0.0;
+	using QueueItem = std::pair<double, size_t>;
+	std::priority_queue<QueueItem, std::vector<QueueItem>, std::greater<QueueItem>> open;
+	open.push({0.0, source});
+	std::vector<bool> closed(n, false);
+
+	while (!open.empty()) {
+		auto [d, u] = open.top();
+		open.pop();
+		if (closed[u]) continue;
+		closed[u] = true;
+		for (auto& [v, e] : adjacency[u]) {
+			if (closed[v]) continue;
+			double w = weight_fn(g, e);
+			double nd = d + w;
+			if (nd < dist[v]) {
+				dist[v] = nd;
+				open.push({nd, v});
+			}
+		}
+	}
+	return dist;
 }

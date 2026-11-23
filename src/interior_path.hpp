@@ -77,9 +77,11 @@
 #include <queue>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
+#include "graph.hpp"  // Graph, EdgeWeightFn, euclidean_edge_weight
 #include "split_criterion.hpp"  // Point2D, distance()
 
 inline double interior_path_cross(const Point2D& o, const Point2D& a, const Point2D& b) {
@@ -469,4 +471,224 @@ inline std::vector<std::vector<double>> split_polygon_along_path(const std::vect
 		pieces.push_back(trace_face(pts, neighbors, sf, st, orientation_sign, used));
 	}
 	return pieces;
+}
+
+// --- Graph-accepting generalization (custom EdgeWeightFn, no injected ------
+//     straight-line chord, no ear-clipping) --------------------------------
+//
+// Unlike the flat-polygon find_interior_path above, this overload is handed
+// a Graph that is ALREADY the full interior mesh (e.g. from
+// ChiOutline::compute_graph()/AlphaOutline::compute_graph()/
+// concavehull_graph()) -- there is nothing left to triangulate, and
+// crucially the cut must be constrained to travel only along the graph's
+// own actual edges. Injecting a synthetic straight-line i-j shortcut (the
+// way the flat-polygon overload does via is_valid_diagonal) would defeat
+// the point of having a real mesh with real, possibly custom-weighted,
+// edges to route through -- so this never adds one.
+//
+// Uses plain Dijkstra (zero heuristic), not A* with a Euclidean heuristic:
+// A*'s Euclidean-distance-to-goal heuristic is only admissible/consistent
+// when edge weights themselves are Euclidean distances. `weight_fn` is
+// arbitrary (e.g. degree-sum, which has no necessary relationship to
+// Euclidean distance at all), so a Euclidean heuristic could overestimate
+// true remaining cost and silently break A*'s optimality guarantee. A zero
+// heuristic keeps the same algorithm structure while staying correct for
+// any non-negative weight_fn, at the cost of A*'s usual speed edge over
+// Dijkstra -- an acceptable trade at this codebase's typical graph sizes.
+inline std::vector<size_t> find_interior_path(const Graph& g, size_t i, size_t j,
+                                                const EdgeWeightFn& weight_fn = euclidean_edge_weight) {
+	size_t n = g.vertices.size();
+	std::vector<std::vector<std::pair<size_t, size_t>>> adjacency(n);  // (neighbor, edge_idx)
+	for (size_t e = 0; e < g.edges.size(); ++e) {
+		auto& [a, b] = g.edges[e];
+		adjacency[a].push_back({b, e});
+		adjacency[b].push_back({a, e});
+	}
+
+	std::vector<double> dist(n, std::numeric_limits<double>::infinity());
+	std::vector<size_t> came_from(n, (size_t)-1);
+	std::vector<bool> closed(n, false);
+	dist[i] = 0.0;
+	using QueueItem = std::pair<double, size_t>;
+	std::priority_queue<QueueItem, std::vector<QueueItem>, std::greater<QueueItem>> open;
+	open.push({0.0, i});
+
+	while (!open.empty()) {
+		auto [d, u] = open.top();
+		open.pop();
+		if (closed[u]) continue;
+		if (u == j) break;
+		closed[u] = true;
+		for (auto& [v, e] : adjacency[u]) {
+			if (closed[v]) continue;
+			double w = weight_fn(g, e);
+			double nd = d + w;
+			if (nd < dist[v]) {
+				dist[v] = nd;
+				came_from[v] = u;
+				open.push({nd, v});
+			}
+		}
+	}
+
+	if (!(dist[j] < std::numeric_limits<double>::infinity())) {
+		return {i, j};  // defensive: no path at all (disconnected graph) -- same fallback spirit as the flat-polygon overload
+	}
+	std::vector<size_t> path;
+	for (size_t v = j;; v = came_from[v]) {
+		path.push_back(v);
+		if (v == i) break;
+	}
+	std::reverse(path.begin(), path.end());
+	return path;
+}
+
+// Index-returning counterpart of trace_face: identical face-walking logic,
+// but accumulates visited vertex INDICES (into `pts`) instead of flat
+// coordinates, since split_graph_along_path (below) needs indices to build
+// each resulting piece's own sub-Graph (remapped vertices/edges, sliced
+// vertex_data/edge_data) -- the flat-coordinate trace_face above is left
+// untouched for the existing flat-polygon call site.
+inline std::vector<size_t> trace_face_indices(const std::vector<Point2D>& pts,
+                                                const std::unordered_map<size_t, std::vector<size_t>>& neighbors,
+                                                size_t start_from, size_t start_to, double orientation_sign,
+                                                std::set<std::pair<size_t, size_t>>& used) {
+	std::vector<size_t> indices;
+	size_t n = pts.size();
+	size_t max_steps = 2 * (n + neighbors.size()) + 8;
+
+	size_t from = start_from, to = start_to;
+	for (size_t step = 0; step < max_steps; ++step) {
+		indices.push_back(from);
+		used.insert({from, to});
+		size_t next = next_face_vertex(pts, neighbors, from, to, orientation_sign);
+		if (to == start_from && next == start_to) break;
+		from = to;
+		to = next;
+	}
+	return indices;
+}
+
+// One resulting piece of a Graph split: its own sub-mesh (remapped vertex
+// indices 0..k-1, with vertex_data/edge_data sliced to match if `g` had
+// any) plus its own boundary cycle, as indices into THIS piece's own
+// `graph.vertices` (not the original `g`'s) -- ready to feed straight back
+// into find_bottleneck/find_interior_path for recursion.
+struct GraphPiece {
+	Graph graph;
+	std::vector<size_t> boundary;
+};
+
+// Graph-accepting generalization of split_polygon_along_path: splits `g`
+// into its resulting pieces by tracing every bounded face of `g`'s own
+// edges (no boundary-cycle-plus-diagonals construction needed -- `g`
+// already contains every edge that matters, see find_interior_path's own
+// comment above) the path crosses, exactly mirroring that function's
+// "1 + k pieces for k genuine diagonals" behavior. Each traced face gives
+// one piece's own boundary; every OTHER vertex/edge of `g` is assigned to
+// whichever piece's boundary it falls inside (point-in-polygon), since a
+// piece here is a full sub-MESH, not just a boundary cycle.
+inline std::vector<GraphPiece> split_graph_along_path(const Graph& g, const std::vector<size_t>& boundary,
+                                                        const std::vector<size_t>& path) {
+	size_t nb = boundary.size();
+
+	double signed_area2 = 0.0;
+	for (size_t k = 0; k < nb; ++k) {
+		size_t k2 = (k + 1) % nb;
+		signed_area2 += g.vertices[boundary[k]].x * g.vertices[boundary[k2]].y -
+		                g.vertices[boundary[k2]].x * g.vertices[boundary[k]].y;
+	}
+	double orientation_sign = signed_area2 > 0.0 ? -1.0 : 1.0;
+
+	std::unordered_map<size_t, size_t> pos_in_boundary;
+	for (size_t k = 0; k < nb; ++k) pos_in_boundary[boundary[k]] = k;
+
+	// The face-TRACING graph must be ONLY the boundary cycle plus the path's
+	// own genuine diagonals -- NOT all of g's edges. `g` is typically a full
+	// triangulated mesh (e.g. from ChiOutline::compute_graph()) with many
+	// interior diagonals that have nothing to do with this particular cut;
+	// including them here would shatter the result into roughly one piece
+	// per original triangle instead of the handful of pieces this cut
+	// actually produces (exactly the same reasoning the flat-polygon
+	// split_polygon_along_path's own `neighbors` construction follows: it
+	// starts from only the n-cycle boundary wraparound, not every
+	// ear-clipping diagonal). Every OTHER edge/vertex of `g` is assigned to
+	// whichever traced piece it geometrically falls inside, further below.
+	std::unordered_map<size_t, std::vector<size_t>> neighbors;
+	for (size_t k = 0; k < nb; ++k) {
+		size_t a = boundary[k], b = boundary[(k + 1) % nb];
+		neighbors[a].push_back(b);
+		neighbors[b].push_back(a);
+	}
+
+	std::vector<std::pair<size_t, size_t>> genuine_diagonals;
+	for (size_t m = 0; m + 1 < path.size(); ++m) {
+		size_t a = path[m], b = path[m + 1];
+		bool already_boundary = false;
+		auto ia = pos_in_boundary.find(a), ib = pos_in_boundary.find(b);
+		if (ia != pos_in_boundary.end() && ib != pos_in_boundary.end()) {
+			already_boundary = (ib->second == (ia->second + 1) % nb) || (ia->second == (ib->second + 1) % nb);
+		}
+		if (!already_boundary) {
+			neighbors[a].push_back(b);
+			neighbors[b].push_back(a);
+			genuine_diagonals.push_back({a, b});
+		}
+	}
+
+	std::set<std::pair<size_t, size_t>> used;
+	std::vector<std::pair<size_t, size_t>> candidates;
+	for (size_t k = 0; k < nb; ++k) {
+		candidates.push_back({boundary[k], boundary[(k + 1) % nb]});
+	}
+	for (auto& [a, b] : genuine_diagonals) {
+		candidates.push_back({a, b});
+		candidates.push_back({b, a});
+	}
+
+	std::vector<std::vector<size_t>> face_boundaries;
+	for (auto& [sf, st] : candidates) {
+		if (used.count({sf, st})) continue;
+		face_boundaries.push_back(trace_face_indices(g.vertices, neighbors, sf, st, orientation_sign, used));
+	}
+
+	std::vector<GraphPiece> out;
+	for (auto& face : face_boundaries) {
+		std::unordered_set<size_t> included(face.begin(), face.end());
+		for (size_t v = 0; v < g.vertices.size(); ++v) {
+			if (included.count(v)) continue;
+			if (point_in_polygon(g.vertices[v], [&] {
+				    std::vector<Point2D> poly;
+				    poly.reserve(face.size());
+				    for (size_t idx : face) poly.push_back(g.vertices[idx]);
+				    return poly;
+			    }())) {
+				included.insert(v);
+			}
+		}
+
+		std::unordered_map<size_t, size_t> remap;
+		remap.reserve(included.size());
+		GraphPiece piece;
+		piece.graph.vertices.reserve(included.size());
+		bool has_vertex_data = !g.vertex_data.empty();
+		if (has_vertex_data) piece.graph.vertex_data.reserve(included.size());
+		for (size_t v : included) {
+			remap[v] = piece.graph.vertices.size();
+			piece.graph.vertices.push_back(g.vertices[v]);
+			if (has_vertex_data) piece.graph.vertex_data.push_back(g.vertex_data[v]);
+		}
+		bool has_edge_data = !g.edge_data.empty();
+		for (size_t e = 0; e < g.edges.size(); ++e) {
+			auto& [a, b] = g.edges[e];
+			if (!included.count(a) || !included.count(b)) continue;
+			piece.graph.edges.push_back({remap[a], remap[b]});
+			if (has_edge_data) piece.graph.edge_data.push_back(g.edge_data[e]);
+		}
+		piece.boundary.reserve(face.size());
+		for (size_t idx : face) piece.boundary.push_back(remap[idx]);
+
+		out.push_back(std::move(piece));
+	}
+	return out;
 }

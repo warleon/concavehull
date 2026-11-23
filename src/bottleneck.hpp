@@ -33,6 +33,7 @@
 #include <cstddef>
 #include <limits>
 #include <memory>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -96,6 +97,31 @@ public:
 			auto parts = split(poly);
 			out.insert(out.end(), std::make_move_iterator(parts.begin()), std::make_move_iterator(parts.end()));
 		}
+		return out;
+	}
+
+	// Graph-accepting generalization of split(): `g` is a complete mesh
+	// (e.g. from ChiOutline::compute_graph()/AlphaOutline::compute_graph()/
+	// concavehull_graph()), `boundary` is its own boundary cycle (vertex
+	// indices into g.vertices, cyclic order -- the compute_graph() family
+	// doesn't return this directly, since a Graph has no inherent vertex
+	// ordering; pair it with the corresponding compute()/concavehull()
+	// output's own vertex order, matched by coordinates). `weight_fn`
+	// (default Euclidean length, so omitting it reproduces split()'s own
+	// numbers when `g` is that polygon's triangulation) replaces distance
+	// everywhere -- both for Eq. 1-2's bottleneck cost (find_bottleneck's
+	// Graph overload, split_criterion.hpp) and for the A* cut path
+	// (find_interior_path's Graph overload, interior_path.hpp), which is
+	// constrained strictly to g's own edges rather than any injected
+	// straight-line chord. Returns one GraphPiece (its own sub-mesh plus
+	// its own boundary cycle) per resulting piece.
+	std::vector<GraphPiece> split_graph(const Graph& g, const std::vector<size_t>& boundary,
+	                                      const EdgeWeightFn& weight_fn = euclidean_edge_weight) const {
+		if (boundary.size() < 3) {
+			throw std::invalid_argument("boundary must have at least 3 vertices");
+		}
+		std::vector<GraphPiece> out;
+		split_graph_recursive(g, boundary, weight_fn, 0, out);
 		return out;
 	}
 
@@ -187,6 +213,67 @@ private:
 
 		for (auto& piece_flat : pieces) {
 			split_recursive(to_points(piece_flat), depth + 1, out);
+		}
+	}
+
+	void split_graph_recursive(Graph g, std::vector<size_t> boundary, const EdgeWeightFn& weight_fn, int depth,
+	                            std::vector<GraphPiece>& out) const {
+		bool leaf = boundary.size() < 6 || depth >= max_depth_ || !criterion_->should_split(g, boundary);
+		if (leaf) {
+			out.push_back({std::move(g), std::move(boundary)});
+			return;
+		}
+
+		BottleneckResult r = find_bottleneck(g, boundary, min_arc_fraction_, weight_fn);
+		if (r.i == SIZE_MAX) {
+			out.push_back({std::move(g), std::move(boundary)});  // criterion wants a split, geometry can't give one
+			return;
+		}
+
+		size_t vi = boundary[r.i], vj = boundary[r.j];
+		std::vector<size_t> cut_path = find_interior_path(g, vi, vj, weight_fn);
+
+		// Same degenerate-case guard as split_recursive's flat-polygon
+		// version: if every consecutive pair in cut_path is already a
+		// boundary-adjacent pair, the path contributes no genuine new edge
+		// at all, so there's no real cut for this (i, j) -- treat like the
+		// "geometry can't give a split" fallback above instead of
+		// recursing without progress.
+		size_t nb = boundary.size();
+		std::unordered_map<size_t, size_t> pos_in_boundary;
+		for (size_t k = 0; k < nb; ++k) pos_in_boundary[boundary[k]] = k;
+		bool any_diagonal = false;
+		for (size_t m = 0; m + 1 < cut_path.size(); ++m) {
+			size_t a = cut_path[m], b = cut_path[m + 1];
+			auto ia = pos_in_boundary.find(a), ib = pos_in_boundary.find(b);
+			bool already_boundary = ia != pos_in_boundary.end() && ib != pos_in_boundary.end() &&
+			                        ((ib->second == (ia->second + 1) % nb) || (ia->second == (ib->second + 1) % nb));
+			if (!already_boundary) {
+				any_diagonal = true;
+				break;
+			}
+		}
+		if (!any_diagonal) {
+			out.push_back({std::move(g), std::move(boundary)});
+			return;
+		}
+
+		std::vector<GraphPiece> pieces = split_graph_along_path(g, boundary, cut_path);
+
+		if (min_piece_area_ > 0.0) {
+			for (auto& piece : pieces) {
+				std::vector<Point2D> piece_boundary_pts;
+				piece_boundary_pts.reserve(piece.boundary.size());
+				for (size_t v : piece.boundary) piece_boundary_pts.push_back(piece.graph.vertices[v]);
+				if (polygon_area(piece_boundary_pts) < min_piece_area_) {
+					out.push_back({std::move(g), std::move(boundary)});  // this cut would create a degenerate sliver -- reject it
+					return;
+				}
+			}
+		}
+
+		for (auto& piece : pieces) {
+			split_graph_recursive(std::move(piece.graph), std::move(piece.boundary), weight_fn, depth + 1, out);
 		}
 	}
 };
