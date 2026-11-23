@@ -86,6 +86,7 @@
 #include <vector>
 
 #include "concavehull.hpp"
+#include "graph.hpp"
 #include "thirdparty/delaunator-header-only.hpp"
 
 class ChiOutline {
@@ -107,6 +108,16 @@ public:
 	// region in the final chi-outline. Outlier points are simply absent from
 	// every returned polygon.
 	std::vector<std::vector<double>> compute();
+
+	// "The complete graph" version of compute(): one Graph per disconnected
+	// region (same components, same small-region filter -- Eq. 2 -- as
+	// compute()), but containing every vertex and edge of that region's own
+	// kept triangulation, not just its boundary cycle. Must be called
+	// exactly once, directly after compute() -- it reads the final
+	// triangle_component/removed_triangle state compute() leaves behind,
+	// the same one-shot restriction compute() itself already has (this
+	// object's whole algorithm is a single drain of the `boundary` queue).
+	std::vector<Graph> compute_graph() const;
 
 private:
 	// NOTE on member order: `m_coords` must be constructed before
@@ -648,6 +659,101 @@ inline std::vector<std::vector<double>> ChiOutline::compute() {
 	}
 
 	return extract_polygons();
+}
+
+inline std::vector<Graph> ChiOutline::compute_graph() const {
+	// A single triangle_component id does not always mean one connected
+	// region: find_pieces's own documentation (and the "cheap pre-check
+	// said >1 cycle but find_pieces disagreed -- treat as no split" case
+	// in compute()'s split-relabeling) both acknowledge that a split can
+	// go undetected, leaving one id secretly hosting two geometrically
+	// disjoint triangle groups -- confirmed directly on real output: one id
+	// produced two completely separate boundary cycles, which
+	// extract_polygons() correctly still returns as two separate polygons
+	// (it walks every unused boundary half-edge per id, regardless of how
+	// many disjoint cycles that id happens to contain) despite nominally
+	// being "one component". Grouping Graph output by raw id alone would
+	// have silently merged those two disjoint regions into one Graph. The
+	// correct grouping is find_pieces()'s own true-connectivity flood fill
+	// (the exact same mechanism compute()'s own split-detection uses),
+	// applied to every id currently present among kept triangles.
+	std::unordered_set<int> ids_present;
+	for (size_t t = 0; t < n_triangles; ++t) {
+		if (!removed_triangle[t]) ids_present.insert(triangle_component[t]);
+	}
+
+	size_t min_points = min_component_points();
+	std::vector<Graph> graphs;
+
+	for (int id : ids_present) {
+		for (auto& piece_tris : find_pieces(id)) {
+			std::unordered_set<size_t> verts;
+			std::set<std::pair<size_t, size_t>> edges;
+			std::vector<size_t> boundary_he;
+
+			for (size_t t : piece_tris) {
+				for (int k = 0; k < 3; ++k) {
+					size_t he = 3 * t + k;
+					size_t pa = d.triangles[he];
+					size_t pb = d.triangles[next_halfedge(he)];
+					verts.insert(pa);
+					verts.insert(pb);
+					edges.insert(pa < pb ? std::make_pair(pa, pb) : std::make_pair(pb, pa));
+					// is_exterior checks only "is the twin triangle removed",
+					// which is exactly right here too: by construction of
+					// find_pieces's flood fill, a kept triangle whose twin is
+					// also kept is necessarily in THIS SAME piece (two
+					// pieces are disjoint precisely because no live edge
+					// connects them), so this never leaks a piece's boundary
+					// into another piece's.
+					if (is_exterior(he)) boundary_he.push_back(he);
+				}
+			}
+
+			// Walk every boundary cycle this piece's own half-edges form
+			// (ordinarily exactly one, per this algorithm's own invariant,
+			// but validated rather than assumed -- same walk-and-filter
+			// extract_polygons() itself uses, Eq. 2) and keep the piece's
+			// full vertex/edge set only if at least one such cycle passes.
+			std::unordered_set<size_t> used;
+			bool any_cycle_kept = false;
+			for (size_t start : boundary_he) {
+				if (used.count(start)) continue;
+				size_t cur = start;
+				size_t loop_start_point = d.triangles[start];
+				bool ok = true;
+				size_t cycle_points = 0;
+				while (true) {
+					used.insert(cur);
+					++cycle_points;
+					size_t next_point = d.triangles[next_halfedge(cur)];
+					if (next_point == loop_start_point) break;
+					size_t nxt = rotate_to_next_boundary(next_halfedge(cur));
+					if (nxt == delaunator::INVALID_INDEX || used.count(nxt)) {
+						ok = false;
+						break;
+					}
+					cur = nxt;
+				}
+				if (ok && cycle_points >= 3 && cycle_points >= min_points) any_cycle_kept = true;
+			}
+			if (!any_cycle_kept) continue;
+
+			std::unordered_map<size_t, size_t> remap;
+			remap.reserve(verts.size());
+			Graph g;
+			g.vertices.reserve(verts.size());
+			for (size_t v : verts) {
+				remap[v] = g.vertices.size();
+				g.vertices.push_back({d.coords[2 * v], d.coords[2 * v + 1]});
+			}
+			for (auto& [a, b] : edges) {
+				g.edges.push_back({remap[a], remap[b]});
+			}
+			graphs.push_back(std::move(g));
+		}
+	}
+	return graphs;
 }
 
 // --- chi <-> length-parameter conversion -----------------------------------

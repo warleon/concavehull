@@ -45,11 +45,14 @@
 #include <cmath>
 #include <functional>
 #include <numeric>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "concavehull.hpp"  // next_halfedge, edge_length, delaunator::Delaunator
+#include "graph.hpp"
 #include "polygon_with_holes.hpp"
 #include "thirdparty/delaunator-header-only.hpp"
 
@@ -79,6 +82,13 @@ public:
 	// region. Outlier points (never part of any kept triangle, or whose
 	// region falls below the small-component filter) are simply absent.
 	std::vector<PolygonWithHoles> compute() const;
+
+	// "The complete graph" version of compute(): one Graph per disconnected
+	// region (same components, same small-region filter), containing every
+	// vertex and edge of that region's own kept triangulation -- not just
+	// its boundary/hole cycles. Repeatable (like compute()): both re-derive
+	// the kept-triangle connected components from scratch each call.
+	std::vector<Graph> compute_graph() const;
 
 private:
 	std::vector<double> m_coords;
@@ -257,4 +267,71 @@ inline std::vector<PolygonWithHoles> AlphaOutline::compute() const {
 	}
 
 	return out;
+}
+
+inline std::vector<Graph> AlphaOutline::compute_graph() const {
+	// Union-find over kept triangles, adjacent via a shared non-removed edge
+	// -- same grouping compute() itself derives, duplicated here (not
+	// shared) since both are small, self-contained, and `const`/repeatable.
+	std::vector<size_t> parent(n_triangles);
+	std::iota(parent.begin(), parent.end(), 0);
+	std::function<size_t(size_t)> find = [&](size_t x) {
+		while (parent[x] != x) {
+			parent[x] = parent[parent[x]];
+			x = parent[x];
+		}
+		return x;
+	};
+	auto unite = [&](size_t a, size_t b) {
+		a = find(a);
+		b = find(b);
+		if (a != b) parent[a] = b;
+	};
+
+	for (size_t t = 0; t < n_triangles; ++t) {
+		if (removed_triangle[t]) continue;
+		for (int k = 0; k < 3; ++k) {
+			size_t he = 3 * t + k;
+			size_t twin = d.halfedges[he];
+			if (twin == delaunator::INVALID_INDEX) continue;
+			size_t nt = triangle_of(twin);
+			if (!removed_triangle[nt]) unite(t, nt);
+		}
+	}
+
+	std::unordered_map<size_t, std::unordered_set<size_t>> verts_by_component;
+	std::unordered_map<size_t, std::set<std::pair<size_t, size_t>>> edges_by_component;
+	for (size_t t = 0; t < n_triangles; ++t) {
+		if (removed_triangle[t]) continue;
+		size_t comp = find(t);
+		for (int k = 0; k < 3; ++k) {
+			size_t he = 3 * t + k;
+			size_t pa = d.triangles[he];
+			size_t pb = d.triangles[next_halfedge(he)];
+			verts_by_component[comp].insert(pa);
+			verts_by_component[comp].insert(pb);
+			edges_by_component[comp].insert(pa < pb ? std::make_pair(pa, pb) : std::make_pair(pb, pa));
+		}
+	}
+
+	size_t min_points = min_component_points();
+	std::vector<Graph> graphs;
+	for (auto& kv : verts_by_component) {
+		const std::unordered_set<size_t>& verts = kv.second;
+		if (verts.size() < min_points) continue;
+
+		std::unordered_map<size_t, size_t> remap;
+		remap.reserve(verts.size());
+		Graph g;
+		g.vertices.reserve(verts.size());
+		for (size_t v : verts) {
+			remap[v] = g.vertices.size();
+			g.vertices.push_back({d.coords[2 * v], d.coords[2 * v + 1]});
+		}
+		for (auto& [a, b] : edges_by_component[kv.first]) {
+			g.edges.push_back({remap[a], remap[b]});
+		}
+		graphs.push_back(std::move(g));
+	}
+	return graphs;
 }
