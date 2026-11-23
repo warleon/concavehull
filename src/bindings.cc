@@ -1,6 +1,7 @@
 #include <cstring>
 #include <memory>
 #include <pybind11/pybind11.h>
+#include <pybind11/functional.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 #include <vector>
@@ -10,7 +11,9 @@
 #include "chioutline.hpp"
 #include "concavehull.hpp"
 #include "dtscan.hpp"
+#include "graph.hpp"
 #include "graph_bottleneck_split.hpp"
+#include "graph_callables.hpp"
 #include "object_cluster.hpp"
 #include "split_criterion.hpp"
 
@@ -75,6 +78,18 @@ py::array_t<double> pyconcavehull(const py::array_t<double>& pts, double chi_fac
 		buf.strides
 		);
 	return py::array_t<double>(resbuf);
+}
+
+Graph pyconcavehull_graph(const py::array_t<double>& pts, double chi_factor) {
+	py::buffer_info buf = pts.request();
+	if (buf.ndim != 2) {
+		throw std::runtime_error("Number of dimensions must be two");
+	}
+	if (buf.shape[1] != 2) {
+		throw std::runtime_error("Second dimension's size must be two");
+	}
+	double *ptr = static_cast<double *>(buf.ptr);
+	return concavehull_graph({ptr, ptr + buf.size}, chi_factor);
 }
 
 std::unique_ptr<ChiOutline> make_chioutline(const py::array_t<double>& pts, double chi) {
@@ -150,6 +165,85 @@ std::vector<py::dict> pyalpha_outline_compute(const AlphaOutline& self) {
 	return out;
 }
 
+std::vector<Graph> pychioutline_compute_graph(const ChiOutline& self) { return self.compute_graph(); }
+
+std::vector<Graph> pyalpha_outline_compute_graph(const AlphaOutline& self) { return self.compute_graph(); }
+
+Graph make_graph(const py::array_t<double>& vertices, const py::array_t<long long>& edges) {
+	Graph g;
+	g.vertices = py_polygon_to_points(vertices);
+	py::buffer_info buf = edges.request();
+	if (buf.ndim != 2 || buf.shape[1] != 2) {
+		throw std::runtime_error("edges must be an Nx2 array");
+	}
+	long long *ptr = static_cast<long long *>(buf.ptr);
+	for (py::ssize_t i = 0; i < buf.shape[0]; ++i) {
+		g.edges.push_back({(size_t)ptr[2 * i], (size_t)ptr[2 * i + 1]});
+	}
+	return g;
+}
+
+py::array_t<double> graph_vertices_to_py(const Graph& g) {
+	py::array_t<double> arr({(py::ssize_t)g.vertices.size(), (py::ssize_t)2});
+	double *ptr = arr.mutable_data();
+	for (size_t i = 0; i < g.vertices.size(); ++i) {
+		ptr[2 * i] = g.vertices[i].x;
+		ptr[2 * i + 1] = g.vertices[i].y;
+	}
+	return arr;
+}
+
+py::array_t<size_t> graph_edges_to_py(const Graph& g) {
+	py::array_t<size_t> arr({(py::ssize_t)g.edges.size(), (py::ssize_t)2});
+	size_t *ptr = arr.mutable_data();
+	for (size_t i = 0; i < g.edges.size(); ++i) {
+		ptr[2 * i] = g.edges[i].first;
+		ptr[2 * i + 1] = g.edges[i].second;
+	}
+	return arr;
+}
+
+py::object graph_data_to_py(const std::vector<double>& data) {
+	if (data.empty()) return py::none();
+	py::array_t<double> arr((py::ssize_t)data.size());
+	std::memcpy(arr.mutable_data(), data.data(), data.size() * sizeof(double));
+	return arr;
+}
+
+VertexDataFn py_to_vertex_fn(const py::object& obj) {
+	if (obj.is_none()) return nullptr;
+	return obj.cast<std::function<std::vector<double>(const Graph&)>>();
+}
+
+EdgeDataFn py_to_edge_fn(const py::object& obj) {
+	if (obj.is_none()) return nullptr;
+	return obj.cast<std::function<std::vector<double>(const Graph&)>>();
+}
+
+EdgeWeightFn py_to_weight_fn(const py::object& obj) {
+	if (obj.is_none()) return euclidean_edge_weight;
+	return obj.cast<std::function<double(const Graph&, size_t)>>();
+}
+
+void pyannotate_graph(Graph& g, const py::object& vertex_fn, const py::object& edge_fn) {
+	annotate_graph(g, py_to_vertex_fn(vertex_fn), py_to_edge_fn(edge_fn));
+}
+
+py::dict pygraph_piece_to_py(const GraphPiece& piece) {
+	py::dict d;
+	d["graph"] = piece.graph;
+	d["boundary"] = piece.boundary;
+	return d;
+}
+
+std::vector<py::dict> pybottleneck_split_graph(const BottleneckSplit& self, const Graph& g,
+                                                 const std::vector<size_t>& boundary, const py::object& weight_fn) {
+	auto pieces = self.split_graph(g, boundary, py_to_weight_fn(weight_fn));
+	std::vector<py::dict> out;
+	for (auto& piece : pieces) out.push_back(pygraph_piece_to_py(piece));
+	return out;
+}
+
 std::vector<py::array_t<double>> pybottleneck_split(const BottleneckSplit& self, const py::array_t<double>& polygon) {
 	return polygons_to_py(self.split(py_polygon_to_flat(polygon)));
 }
@@ -201,6 +295,54 @@ PYBIND11_MODULE(concavehull, m) {
 	m.def("concavehull", &pyconcavehull, "Find concave hull from array of 2D points",
 	      py::arg("pts"), py::arg("chi_factor") = 0.1);
 
+	m.def("concavehull_graph", &pyconcavehull_graph, py::arg("pts"), py::arg("chi_factor") = 0.1,
+	      "\"The complete graph\" for concavehull(): the Delaunay triangulation "
+	      "of every input point, MINUS every triangle the dig excluded (see "
+	      "concavehull_impl's own comment in concavehull.hpp) -- deliberately "
+	      "depends on chi_factor (more digging excludes more triangles), "
+	      "unlike returning the raw unfiltered triangulation would.");
+
+	py::class_<Graph>(m, "Graph",
+	    "A plain undirected graph over polygon/point-cloud vertices -- the "
+	    "full surviving mesh of whichever outline algorithm produced it "
+	    "(concavehull_graph(), ChiOutline.compute_graph(), "
+	    "AlphaOutline.compute_graph()), not just its boundary cycle. "
+	    "Optionally annotated with custom per-vertex/per-edge data via "
+	    "annotate_graph(), which BottleneckSplit.split_graph() can then use "
+	    "(via a weight_fn callable) in place of Euclidean edge length.")
+	    .def(py::init(&make_graph), py::arg("vertices"), py::arg("edges"),
+	         "Hand-build a Graph directly: `vertices` is an Nx2 array, "
+	         "`edges` is an Mx2 integer array of vertex-index pairs.")
+	    .def_property_readonly("vertices", &graph_vertices_to_py, "Nx2 array of vertex coordinates.")
+	    .def_property_readonly("edges", &graph_edges_to_py, "Mx2 integer array of vertex-index pairs.")
+	    .def_property_readonly(
+	        "vertex_data", [](const Graph& g) { return graph_data_to_py(g.vertex_data); },
+	        "Per-vertex custom data (array, same length as vertices), or None if never annotated.")
+	    .def_property_readonly(
+	        "edge_data", [](const Graph& g) { return graph_data_to_py(g.edge_data); },
+	        "Per-edge custom data (array, same length as edges), or None if never annotated.");
+
+	m.def("annotate_graph", &pyannotate_graph, py::arg("graph"), py::arg("vertex_fn") = py::none(),
+	      py::arg("edge_fn") = py::none(),
+	      "Mutates `graph` in place: `vertex_fn(graph) -> list[float]` (one "
+	      "value per vertex) runs first and is stored as graph.vertex_data; "
+	      "`edge_fn(graph) -> list[float]` (one value per edge, may read the "
+	      "just-populated graph.vertex_data) runs second and is stored as "
+	      "graph.edge_data. Either may be omitted (None) to skip that half. "
+	      "Any Python callable works here -- a plain function, a lambda, or "
+	      "an object with __call__.");
+
+	m.def("vertex_degree", [](const Graph& g) { return vertex_degree(g); }, py::arg("graph"),
+	      "VertexDataFn: each vertex's own incident-edge count.");
+	m.def(
+	    "edge_weight_sum_of_vertex_data", [](const Graph& g) { return edge_weight_sum_of_vertex_data(g); },
+	    py::arg("graph"),
+	    "EdgeDataFn: each edge's weight = the sum of its two endpoints' "
+	    "already-populated graph.vertex_data. Composed with vertex_degree via "
+	    "annotate_graph(g, vertex_degree, edge_weight_sum_of_vertex_data), "
+	    "the resulting graph.edge_data is then usable directly as a weight_fn "
+	    "for BottleneckSplit.split_graph() -- `lambda g, e: g.edge_data[e]`.");
+
 	py::class_<ChiOutline>(m, "ChiOutline",
 	    "Chi-outline algorithm (Zhong & Duckham, 2016): extends the chi-shape "
 	    "algorithm to produce possibly disconnected simple polygons and to "
@@ -216,6 +358,14 @@ PYBIND11_MODULE(concavehull, m) {
 	    .def("compute", &pychioutline_compute,
 	         "Run the algorithm, returning a list of Nx2 arrays, one per "
 	         "disconnected polygon found.")
+	    .def("compute_graph", &pychioutline_compute_graph,
+	         "'The complete graph' version of compute(): one Graph per "
+	         "disconnected region (same components/filter as compute()), "
+	         "containing every vertex and edge of that region's own kept "
+	         "triangulation, not just its boundary cycle. Must be called "
+	         "exactly once, directly after compute() -- it reads the final "
+	         "state compute() leaves behind, the same one-shot restriction "
+	         "compute() itself already has.")
 	    .def_static("chi_to_length", &pychioutline_length_for_chi, py::arg("pts"), py::arg("chi"),
 	         "Convert chi to the corresponding edge-length threshold "
 	         "lambda = mu + chi*sigma for `pts`'s whole Delaunay triangulation "
@@ -253,7 +403,12 @@ PYBIND11_MODULE(concavehull, m) {
 	    .def("compute", &pyalpha_outline_compute,
 	         "Run the algorithm, returning a list of "
 	         "{'exterior': Nx2 array, 'holes': list of Nx2 arrays} dicts, "
-	         "one per disconnected region.");
+	         "one per disconnected region.")
+	    .def("compute_graph", &pyalpha_outline_compute_graph,
+	         "'The complete graph' version of compute(): one Graph per "
+	         "disconnected region, containing every vertex and edge of that "
+	         "region's own kept triangulation -- not just its boundary/hole "
+	         "cycles. Repeatable (like compute()).");
 
 	py::class_<SplitCriterion, std::shared_ptr<SplitCriterion>>(m, "SplitCriterion",
 	    "Abstract shape-classification criterion: decides whether a polygon "
@@ -323,7 +478,24 @@ PYBIND11_MODULE(concavehull, m) {
 	         "Split a single polygon (Nx2 array) into sub-polygons.")
 	    .def("split_all", &pybottleneck_split_all, py::arg("polygons"),
 	         "Split every polygon in a list (e.g. ChiOutline.compute() output) "
-	         "and return the flattened result.");
+	         "and return the flattened result.")
+	    .def("split_graph", &pybottleneck_split_graph, py::arg("graph"), py::arg("boundary"),
+	         py::arg("weight_fn") = py::none(),
+	         "Graph-accepting generalization of split(): `graph` is a complete "
+	         "mesh (e.g. from ChiOutline.compute_graph()/AlphaOutline."
+	         "compute_graph()/concavehull_graph()), `boundary` is its own "
+	         "boundary cycle (list of vertex indices into graph.vertices, "
+	         "cyclic order -- pair the compute_graph() output with the "
+	         "corresponding compute()/concavehull() output's own vertex "
+	         "order, matched by coordinates). `weight_fn(graph, edge_idx) -> "
+	         "float` (default None = Euclidean edge length, so omitting it "
+	         "reproduces split()'s own numbers when `graph` is that "
+	         "polygon's triangulation) replaces distance everywhere -- both "
+	         "for the bottleneck cost and for the A* cut path, which is "
+	         "constrained strictly to graph's own edges rather than any "
+	         "injected straight-line chord. Returns a list of "
+	         "{'graph': Graph, 'boundary': list[int]} dicts, one per "
+	         "resulting piece.");
 
 	m.def("dtscan", &pydtscan, py::arg("pts"), py::arg("area_z_threshold") = 1.0,
 	      py::arg("length_z_threshold") = 1.0, py::arg("min_pts") = 3,
