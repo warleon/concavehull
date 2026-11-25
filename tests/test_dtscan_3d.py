@@ -93,3 +93,35 @@ def test_a_single_tight_cluster_is_one_cluster_not_shattered():
     distinct = set(r.labels.tolist()) - {-1}
     assert len(distinct) == 1
     assert (r.labels != -1).sum() > 80
+
+
+def test_result_exposes_points_and_surviving_tetrahedra():
+    # The 3D analogue of the 2D Graph/compute_graph() output: the actual
+    # kept mesh (tetrahedra surviving stage-1 z-score pruning), not just
+    # cluster labels.
+    rng = np.random.default_rng(1)
+    centers = [(0, 0, 0), (15, 0, 0), (7.5, 13, 0), (7.5, 4, 13)]
+    pts = np.vstack([rng.normal(c, 0.5, size=(60, 3)) for c in centers])
+
+    r = dtscan_3d(pts, volume_z_threshold=1.0, length_z_threshold=1.0, min_pts=4)
+
+    assert np.array_equal(r.points, pts)
+    assert r.tetrahedra.ndim == 2 and r.tetrahedra.shape[1] == 4
+    assert len(r.tetrahedra) > 0
+    assert r.tetrahedra.min() >= 0
+    assert r.tetrahedra.max() < len(pts)
+
+    # a surviving tetrahedron is, by construction, a tight local
+    # neighborhood -- it should never straddle two DIFFERENT real clusters
+    # (it may still touch noise-labeled vertices, e.g. right at a cluster's
+    # own fringe).
+    for tet in r.tetrahedra:
+        real_labels = set(r.labels[tet].tolist()) - {-1}
+        assert len(real_labels) <= 1
+
+
+def test_too_few_points_returns_empty_mesh():
+    pts = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    r = dtscan_3d(pts)
+    assert r.points.shape == (3, 3)
+    assert r.tetrahedra.shape == (0, 4)

@@ -40,6 +40,12 @@ class DTScan3DResult:
     # labels[i] is the 0-based cluster id of points[i], or -1 if noise.
     labels: np.ndarray
     n_clusters: int
+    # The input points, and the surviving mesh (tetrahedra that passed
+    # stage-1 z-score pruning) as an (T, 4) array of vertex indices into
+    # `points` -- the 3D analogue of the 2D `Graph`/`compute_graph()`
+    # output: the actual kept triangulation, not just cluster labels.
+    points: np.ndarray
+    tetrahedra: np.ndarray
 
 
 def _tetrahedron_volume(p0, p1, p2, p3):
@@ -58,15 +64,16 @@ def dtscan_3d(points, volume_z_threshold: float = 1.0, length_z_threshold: float
     points = np.asarray(points, dtype=float)
     n = len(points)
     labels = np.full(n, -1, dtype=int)
+    empty_tets = np.empty((0, 4), dtype=int)
     if n < 4:
-        return DTScan3DResult(labels=labels, n_clusters=0)
+        return DTScan3DResult(labels=labels, n_clusters=0, points=points, tetrahedra=empty_tets)
 
     alpha_complex = gudhi.AlphaComplex(points=points)
     simplex_tree = alpha_complex.create_simplex_tree(max_alpha_square=float("inf"))
 
     tetrahedra = [s for s, _ in simplex_tree.get_simplices() if len(s) == 4]
     if not tetrahedra:
-        return DTScan3DResult(labels=labels, n_clusters=0)
+        return DTScan3DResult(labels=labels, n_clusters=0, points=points, tetrahedra=empty_tets)
 
     # --- Stage 1: z-score pruning (volume generalizes "area"; edge length
     # is unchanged) ---
@@ -130,4 +137,8 @@ def dtscan_3d(points, volume_z_threshold: float = 1.0, length_z_threshold: float
                 labels[q] = cluster_id
         cluster_id += 1
 
-    return DTScan3DResult(labels=labels, n_clusters=cluster_id)
+    surviving_tetrahedra = np.array([tet for t, tet in enumerate(tetrahedra) if survives[t]], dtype=int)
+    if surviving_tetrahedra.size == 0:
+        surviving_tetrahedra = empty_tets
+
+    return DTScan3DResult(labels=labels, n_clusters=cluster_id, points=points, tetrahedra=surviving_tetrahedra)
