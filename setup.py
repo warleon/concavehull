@@ -3,13 +3,14 @@ from setuptools import setup
 from pybind11.setup_helpers import Pybind11Extension, build_ext
 
 ext_modules = [
-    Pybind11Extension("concavehull",
+    Pybind11Extension("concavehull._concavehull",
                       ["src/bindings.cc"],
                       cxx_std=20
     ),
 ]
 
 setup(
+    packages=["concavehull", "concavehull.three_d"],
     ext_modules=ext_modules,
     cmdclass={"build_ext": build_ext}
 )

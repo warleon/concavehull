@@ -291,7 +291,7 @@ std::vector<std::vector<size_t>> pygraph_bottleneck_split(const GraphBottleneckS
 	return self.split(group, cluster_graph.graph());
 }
 
-PYBIND11_MODULE(concavehull, m) {
+PYBIND11_MODULE(_concavehull, m) {
 	m.def("concavehull", &pyconcavehull, "Find concave hull from array of 2D points",
 	      py::arg("pts"), py::arg("chi_factor") = 0.1);
 
